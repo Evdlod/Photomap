@@ -29,6 +29,10 @@ TEST_DIR_NAME = 'test_run'
 TEST_FILE_LIMIT = 1000
 PROGRESS_STEP = 5          # шаг вывода прогресса, процентов
 LOG_CONSOLE_LIMIT = 5      # сколько первых ошибок дублировать в консоль
+SKIP_NOTICE_STEP = 500     # через сколько пропущенных миниатюр сообщать о них
+
+# Папка, которая сканируется, если путь не передан аргументом.
+DEFAULT_PHOTO_DIR = r'D:\YandexDisk\Альбомы по годам'
 
 
 def _configure_console():
@@ -102,9 +106,12 @@ def progress_printer(label, total, step=PROGRESS_STEP):
     строка появляется каждые 50 файлов: 5%, 10%, …, 100%.
     """
     every = max(1, int(round(total * step / 100)))
+    printed = 0
 
     def report(index):
-        if index % every == 0 or index >= total:
+        nonlocal printed
+        if (index % every == 0 or index >= total) and index != printed:
+            printed = index
             percent = min(100, round(index * 100 / total))
             print(f'⏳ {label}: {percent}% ({index} из {total})')
 
@@ -375,6 +382,11 @@ def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
         dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
         status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
         stats[status] += 1
+        if status == 'skipped' and stats['skipped'] % SKIP_NOTICE_STEP == 0:
+            note = (f'Пропущено уже готовых миниатюр: {stats["skipped"]} '
+                    f'(не пересоздаются)')
+            print(f'♻️  {note}')
+            log.info(note)
         if status != 'failed':
             # Ключ совпадает с полем file в JSON: оба считаются от url_base.
             rel_file = os.path.relpath(path, url_base).replace('\\', '/')
@@ -383,10 +395,37 @@ def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
     return result, stats
 
 
-def main(root_dir='.', thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True,
+def resolve_root(root_dir):
+    """Абсолютный путь к папке с фотографиями.
+
+    Если путь не передан, берётся DEFAULT_PHOTO_DIR. Переменные окружения
+    вида %USERPROFILE% раскрываются, '~' тоже понимается.
+    """
+    path = root_dir if root_dir else DEFAULT_PHOTO_DIR
+    path = os.path.expandvars(os.path.expanduser(path))
+    # Windows-путь в не-Windows среде (WSL, Linux) не склеиваем с текущей папкой:
+    # так ошибка «папка не найдена» показывает исходный путь, а не /cwd/D:\...
+    if os.name != 'nt' and re.match(r'^[A-Za-z]:[\\/]', path):
+        return path
+    return os.path.abspath(path)
+
+
+def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True,
          log_path=None, force_thumbs=False, test_limit=None):
     started = datetime.now()
-    root_dir = os.path.abspath(root_dir)
+    used_default = not root_dir
+    root_dir = resolve_root(root_dir)
+    if not os.path.isdir(root_dir):
+        print(f'❌ Папка не найдена: {root_dir}')
+        if used_default:
+            print(f'   Это папка по умолчанию ({DEFAULT_PHOTO_DIR}).')
+            print('   Укажите путь явно:  python photo_map.py "D:\\путь\\к\\фотографиям"')
+            print('   Или текущую папку:  python photo_map.py .')
+        else:
+            print('   Проверьте путь и повторите запуск.')
+        return 1
+    if used_default:
+        print(f'📂 Папка по умолчанию: {root_dir}')
     # В пробном прогоне результаты и лог уходят в отдельную папку:
     # боевые points_*.json и миниатюры не перезаписываются.
     out_dir = os.path.join(root_dir, TEST_DIR_NAME) if test_limit else root_dir
@@ -547,8 +586,8 @@ def main(root_dir='.', thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=T
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description='Сканирует фотографии, строит фото-карту и псевдопути.')
-    parser.add_argument('root', nargs='?', default='.',
-                        help='папка с фотографиями (по умолчанию — текущая)')
+    parser.add_argument('root', nargs='?', default=None,
+                        help=f'папка с фотографиями (по умолчанию — {DEFAULT_PHOTO_DIR})')
     parser.add_argument('--thumbs-dir', default=None,
                         help=f'папка для миниатюр (по умолчанию <root>/{THUMB_DIR_NAME})')
     parser.add_argument('--thumb-size', type=int, default=THUMB_MAX_SIZE,
@@ -570,6 +609,6 @@ def parse_args(argv):
 if __name__ == '__main__':
     _configure_console()
     args = parse_args(sys.argv[1:])
-    main(args.root, thumbs_dir=args.thumbs_dir, thumb_size=args.thumb_size,
-         make_thumbs=not args.no_thumbs, log_path=args.log,
-         force_thumbs=args.force_thumbs, test_limit=args.test)
+    sys.exit(main(args.root, thumbs_dir=args.thumbs_dir, thumb_size=args.thumb_size,
+                  make_thumbs=not args.no_thumbs, log_path=args.log,
+                  force_thumbs=args.force_thumbs, test_limit=args.test) or 0)
