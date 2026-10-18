@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -21,6 +22,130 @@ MAX_PATH_DISTANCE_M = 1000.0
 THUMB_DIR_NAME = 'ico'
 THUMB_MAX_SIZE = 240
 THUMB_QUALITY = 85
+
+# Журнал ошибок и пробный прогон.
+LOG_FILE_NAME = 'photo_map.log'
+TEST_DIR_NAME = 'test_run'
+TEST_FILE_LIMIT = 1000
+PROGRESS_STEP = 5          # шаг вывода прогресса, процентов
+LOG_CONSOLE_LIMIT = 5      # сколько первых ошибок дублировать в консоль
+
+
+def _configure_console():
+    """Переводит консоль в UTF-8, чтобы эмодзи не ломали вывод на Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+class RunLog:
+    """Журнал работы: ошибки и предупреждения пишутся в файл (UTF-8).
+
+    Первые LOG_CONSOLE_LIMIT ошибок дублируются в консоль, дальше консоль
+    не засоряется — при тысячах неподдерживаемых HEIC это важно.
+    """
+
+    def __init__(self, path=None, console_limit=LOG_CONSOLE_LIMIT):
+        self.path = os.path.abspath(path) if path else None
+        self.console_limit = console_limit
+        self.errors = 0
+        self.warnings = 0
+        self._stream = None
+        if self.path:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            self._stream = open(self.path, 'a', encoding='utf-8')
+
+    def _stamp(self):
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _write(self, text):
+        if self._stream:
+            self._stream.write(text + '\n')
+            self._stream.flush()
+
+    def section(self, title):
+        self._write('')
+        self._write(f'===== {title} =====')
+
+    def info(self, message):
+        self._write(f'[{self._stamp()}] {message}')
+
+    def warning(self, message):
+        self.warnings += 1
+        self._write(f'[{self._stamp()}] ВНИМАНИЕ {message}')
+
+    def error(self, message):
+        self.errors += 1
+        self._write(f'[{self._stamp()}] ОШИБКА {message}')
+        if self.errors <= self.console_limit:
+            print(f'⚠️ {message}', file=sys.stderr)
+        elif self.errors == self.console_limit + 1:
+            print(f'⚠️ Дальнейшие ошибки — только в логе: {self.path}', file=sys.stderr)
+
+    def close(self):
+        if self._stream:
+            self._stream.close()
+            self._stream = None
+
+
+DEFAULT_LOG = RunLog()
+
+
+def progress_printer(label, total, step=PROGRESS_STEP):
+    """Возвращает функцию: печатает прогресс шагами по step% от ожидаемого объёма.
+
+    Шаг считается от предполагаемого количества (total), поэтому для 1000 файлов
+    строка появляется каждые 50 файлов: 5%, 10%, …, 100%.
+    """
+    every = max(1, int(round(total * step / 100)))
+
+    def report(index):
+        if index % every == 0 or index >= total:
+            percent = min(100, round(index * 100 / total))
+            print(f'⏳ {label}: {percent}% ({index} из {total})')
+
+    return report
+
+
+def register_heic_support():
+    """Подключает pillow-heif, если он установлен. Иначе HEIC/HEIF не декодируются."""
+    try:
+        import pillow_heif
+    except ImportError:
+        return False
+    pillow_heif.register_heif_opener()
+    return True
+
+
+def collect_images(root_dir, excluded_dirs):
+    """Собирает изображения, не заходя в папки миниатюр и пробных прогонов."""
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [
+            name for name in dirnames
+            if os.path.abspath(os.path.join(dirpath, name)) not in excluded_dirs
+        ]
+        for filename in filenames:
+            if filename.lower().endswith(EXTENSIONS):
+                files.append(os.path.join(dirpath, filename))
+    files.sort()
+    return files
+
+
+def copy_viewer_files(target_dir):
+    """Копирует map.html и photo-path.html рядом с JSON пробного прогона."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    copied = []
+    for name in ('map.html', 'photo-path.html'):
+        source = os.path.join(script_dir, name)
+        if os.path.isfile(source):
+            shutil.copyfile(source, os.path.join(target_dir, name))
+            copied.append(name)
+    return copied
 
 
 def dms_to_dd(dms, ref):
@@ -53,8 +178,9 @@ def parse_exif_datetime(value):
         return None
 
 
-def get_metadata(path):
+def get_metadata(path, log=None):
     """Возвращает (широта, долгота, дата); отсутствующие значения равны None."""
+    log = log or DEFAULT_LOG
     lat = lon = timestamp = None
     try:
         with Image.open(path) as img:
@@ -85,7 +211,7 @@ def get_metadata(path):
                         if lat == 0.0 and lon == 0.0:
                             lat = lon = None
     except Exception as exc:
-        print(f'⚠️ Не удалось прочитать метаданные {path}: {exc}', file=sys.stderr)
+        log.error(f'Не удалось прочитать метаданные {path}: {exc}')
 
     if timestamp is None:
         try:
@@ -123,12 +249,18 @@ def plan_thumbnails(files, root_dir):
     return plan
 
 
-def make_thumbnail(source_path, dest_path, max_size=THUMB_MAX_SIZE):
+def make_thumbnail(source_path, dest_path, max_size=THUMB_MAX_SIZE, log=None, force=False):
     """Создаёт уменьшенную копию: не более max_size пикселей по ширине и высоте.
 
-    Ориентация EXIF учитывается, прозрачность заливается белым. Возвращает
-    True, если миниатюра создана.
+    Ориентация EXIF учитывается, прозрачность заливается белым.
+    Уже существующая миниатюра не пересоздаётся (если не указан force).
+    Возвращает 'created', 'skipped' или 'failed'.
     """
+    log = log or DEFAULT_LOG
+    if not force and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+        return 'skipped'
+
+    tmp_path = dest_path + '.tmp'
     try:
         with Image.open(source_path) as img:
             img = ImageOps.exif_transpose(img)
@@ -143,11 +275,18 @@ def make_thumbnail(source_path, dest_path, max_size=THUMB_MAX_SIZE):
             parent = os.path.dirname(dest_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            img.save(dest_path, 'JPEG', quality=THUMB_QUALITY, optimize=True)
-            return True
+            img.save(tmp_path, 'JPEG', quality=THUMB_QUALITY, optimize=True)
+        # Переименование атомарно: недописанный файл не будет принят за готовый.
+        os.replace(tmp_path, dest_path)
+        return 'created'
     except Exception as exc:
-        print(f'⚠️ Не удалось создать миниатюру {source_path}: {exc}', file=sys.stderr)
-        return False
+        log.error(f'Не удалось создать миниатюру {source_path}: {exc}')
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return 'failed'
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -207,61 +346,112 @@ def build_paths(points):
     return paths
 
 
-def build_thumbnails(files, root_dir, thumbs_root, thumb_size):
-    """Создаёт миниатюры и возвращает {исходный файл: путь миниатюры для JSON}."""
-    url_prefix = os.path.relpath(thumbs_root, root_dir).replace('\\', '/')
+def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
+                     url_base=None, log=None, force=False):
+    """Создаёт недостающие миниатюры.
+
+    Возвращает ({исходный файл: путь миниатюры для JSON}, статистику по статусам).
+    Готовые миниатюры не пересоздаются, но всё равно попадают в результат,
+    чтобы поле thumb было в JSON и после повторного запуска.
+    """
+    log = log or DEFAULT_LOG
+    url_base = url_base or root_dir
+    try:
+        url_prefix = os.path.relpath(thumbs_root, url_base).replace('\\', '/')
+    except ValueError:
+        # Windows: папка миниатюр на другом диске, относительную ссылку не построить.
+        log.warning(f'Папка миниатюр {thumbs_root} на другом диске: '
+                    f'ссылки в JSON будут указывать на {THUMB_DIR_NAME}/')
+        url_prefix = THUMB_DIR_NAME
     if url_prefix == '.':
         url_prefix = ''
 
     plan = plan_thumbnails(files, root_dir)
-    print(f'🖼️  Создаю миниатюры (не более {thumb_size} px) в {thumbs_root}...')
+    print(f'🖼️  Миниатюры (не более {thumb_size} px) в {thumbs_root}')
+    report = progress_printer('Миниатюры', len(plan))
     result = {}
-    milestones = {max(1, int(len(plan) * p / 100)) for p in range(10, 101, 10)}
+    stats = {'created': 0, 'skipped': 0, 'failed': 0}
     for index, (path, rel_thumb) in enumerate(plan.items(), 1):
-        if index in milestones:
-            print(f'⏳ Прогресс миниатюр: {int(index / len(plan) * 100)}%')
         dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
-        if make_thumbnail(path, dest, thumb_size):
-            rel_file = os.path.relpath(path, root_dir).replace('\\', '/')
+        status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
+        stats[status] += 1
+        if status != 'failed':
+            # Ключ совпадает с полем file в JSON: оба считаются от url_base.
+            rel_file = os.path.relpath(path, url_base).replace('\\', '/')
             result[rel_file] = f'{url_prefix}/{rel_thumb}' if url_prefix else rel_thumb
-    return result
+        report(index)
+    return result, stats
 
 
-def main(root_dir='.', thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True):
+def main(root_dir='.', thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True,
+         log_path=None, force_thumbs=False, test_limit=None):
+    started = datetime.now()
     root_dir = os.path.abspath(root_dir)
-    print('🔍 Подсчет файлов...')
-    files = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.lower().endswith(EXTENSIONS):
-                files.append(os.path.join(dirpath, filename))
-    files.sort()
+    # В пробном прогоне результаты и лог уходят в отдельную папку:
+    # боевые points_*.json и миниатюры не перезаписываются.
+    out_dir = os.path.join(root_dir, TEST_DIR_NAME) if test_limit else root_dir
+    if test_limit:
+        os.makedirs(out_dir, exist_ok=True)
+    thumbs_root = (os.path.abspath(thumbs_dir) if thumbs_dir
+                   else os.path.join(out_dir, THUMB_DIR_NAME))
+    log = RunLog(os.path.abspath(log_path) if log_path
+                 else os.path.join(out_dir, LOG_FILE_NAME))
+    log.section(f'Запуск {started:%Y-%m-%d %H:%M:%S}')
+    log.info(f'Папка с фотографиями: {root_dir}')
+    if test_limit:
+        log.info(f'Пробный прогон: не более {test_limit} файлов, результаты в {out_dir}')
 
-    total = len(files)
-    print(f'📸 Найдено изображений: {total}')
-    if not total:
+    # Собственные папки результатов не должны попадать в сканирование,
+    # иначе миниатюры .jpg со второго запуска начнут считаться фотографиями.
+    excluded_dirs = {os.path.abspath(path) for path in (
+        thumbs_root,
+        os.path.join(root_dir, THUMB_DIR_NAME),
+        os.path.join(root_dir, TEST_DIR_NAME),
+    )}
+
+    print('🔍 Подсчет файлов...')
+    files = collect_images(root_dir, excluded_dirs)
+    found = len(files)
+    print(f'📸 Найдено изображений: {found}')
+    if not found:
         print('Изображения не найдены; JSON-файлы не созданы.')
+        log.info('Изображения не найдены.')
+        log.close()
         return
 
+    if test_limit:
+        files = files[:test_limit]
+        print(f'🧪 Пробный прогон: обрабатываю {len(files)} из {found} файлов')
+        log.info(f'Пробный прогон: обрабатываю {len(files)} из {found} файлов')
+
+    total = len(files)
+    if not register_heic_support() and any(
+            path.lower().endswith(('.heic', '.heif')) for path in files):
+        hint = ('HEIC/HEIF не декодируется установленной Pillow: для таких файлов '
+                'не будет ни миниатюр, ни метаданных. Установите: '
+                'python -m pip install pillow-heif')
+        print(f'💡 {hint}')
+        log.warning(hint)
+
     thumbs = {}
-    thumbs_root = None
     if make_thumbs:
-        thumbs_root = (os.path.abspath(thumbs_dir) if thumbs_dir
-                       else os.path.join(root_dir, THUMB_DIR_NAME))
-        thumbs = build_thumbnails(files, root_dir, thumbs_root, thumb_size)
-        print(f'🖼️  Миниатюр создано: {len(thumbs)} из {total}')
+        thumbs, stats = build_thumbnails(files, root_dir, thumbs_root, thumb_size,
+                                         url_base=out_dir, log=log, force=force_thumbs)
+        summary = (f'создано {stats["created"]}, уже были {stats["skipped"]}, '
+                   f'ошибок {stats["failed"]}')
+        print(f'🖼️  Миниатюры: {summary}')
+        log.info(f'Миниатюры: {summary}')
     else:
         print('🖼️  Миниатюры отключены (--no-thumbs).')
 
     print('⚙️ Извлечение метаданных...')
     all_items = []
-    milestones = {max(1, int(total * p / 100)) for p in range(10, 101, 10)}
-    for i, path in enumerate(files, 1):
-        if i in milestones:
-            print(f'⏳ Прогресс: {int(i / total * 100)}%')
-        lat, lon, timestamp = get_metadata(path)
-        rel_path = os.path.relpath(path, root_dir).replace('\\', '/')
+    report = progress_printer('Метаданные', total)
+    for index, path in enumerate(files, 1):
+        lat, lon, timestamp = get_metadata(path, log=log)
+        rel_path = os.path.relpath(path, out_dir).replace('\\', '/')
         all_items.append({'lat': lat, 'lon': lon, 'timestamp': timestamp, 'file': rel_path})
+        report(index)
 
     by_year = defaultdict(list)
     for item in all_items:
@@ -322,20 +512,36 @@ def main(root_dir='.', thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=T
         points_out.sort(key=lambda point: point['timestamp'] or '')
         paths = build_paths(points_out)
 
-        output_file = os.path.join(root_dir, f'points_{year}.json')
-        with open(output_file, 'w', encoding='utf-8') as file_obj:
-            json.dump({'points': points_out, 'paths': paths}, file_obj,
-                      ensure_ascii=False, indent=2)
+        output_file = os.path.join(out_dir, f'points_{year}.json')
+        try:
+            with open(output_file, 'w', encoding='utf-8') as file_obj:
+                json.dump({'points': points_out, 'paths': paths}, file_obj,
+                          ensure_ascii=False, indent=2)
+        except OSError as exc:
+            log.error(f'Не удалось записать {output_file}: {exc}')
+            continue
 
         real_count = sum(not point['fake'] for point in points_out)
         fake_count = len(points_out) - real_count
         print(f'  📁 {os.path.basename(output_file)}: {real_count} реальных + '
               f'{fake_count} фейковых точек, {len(paths)} путей')
 
-    print('\n✅ Готово! Откройте map.html через локальный сервер.')
-    if thumbs_root:
-        print(f'🖼️  Миниатюры: {thumbs_root} (ссылки из JSON ведут на '
-              f'{os.path.relpath(thumbs_root, root_dir).replace(os.sep, "/")}/)')
+    elapsed = (datetime.now() - started).total_seconds()
+    print('\n✅ Готово!')
+    if test_limit:
+        copied = copy_viewer_files(out_dir)
+        print(f'🧪 Результаты пробного прогона: {out_dir}')
+        if copied:
+            print(f'   Откройте http://localhost:8000/{TEST_DIR_NAME}/map.html — '
+                  f'сервер запускайте из {root_dir}')
+    else:
+        print('   Откройте map.html через локальный сервер.')
+    if make_thumbs:
+        print(f'🖼️  Миниатюры: {thumbs_root}')
+    print(f'📝 Лог: {log.path} (ошибок: {log.errors}, предупреждений: {log.warnings})')
+    log.info(f'Итог: файлов {total}, ошибок {log.errors}, '
+             f'предупреждений {log.warnings}, время {elapsed:.1f} с')
+    log.close()
 
 
 def parse_args(argv):
@@ -349,10 +555,21 @@ def parse_args(argv):
                         help='максимальный размер миниатюры по ширине и высоте, px')
     parser.add_argument('--no-thumbs', action='store_true',
                         help='не создавать миниатюры')
+    parser.add_argument('--force-thumbs', action='store_true',
+                        help='пересоздать миниатюры, даже если файлы уже есть')
+    parser.add_argument('--log', default=None, metavar='ФАЙЛ',
+                        help=f'файл журнала (по умолчанию <root>/{LOG_FILE_NAME})')
+    parser.add_argument('--test', nargs='?', type=int, const=TEST_FILE_LIMIT,
+                        default=None, metavar='N',
+                        help=f'пробный прогон на N файлах (по умолчанию {TEST_FILE_LIMIT}); '
+                             f'результаты и лог — в {TEST_DIR_NAME}/, '
+                             f'боевые JSON и миниатюры не трогаются')
     return parser.parse_args(argv)
 
 
 if __name__ == '__main__':
+    _configure_console()
     args = parse_args(sys.argv[1:])
     main(args.root, thumbs_dir=args.thumbs_dir, thumb_size=args.thumb_size,
-         make_thumbs=not args.no_thumbs)
+         make_thumbs=not args.no_thumbs, log_path=args.log,
+         force_thumbs=args.force_thumbs, test_limit=args.test)
