@@ -5,3 +5,4 @@ points_*.json
 # Кэш Python
 __pycache__/
 *.py[cod]
+ico/
