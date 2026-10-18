@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Фото-карта</title>
+<style>
+*{box-sizing:border-box}html,body,#map{width:100%;height:100%;margin:0;font:14px system-ui,Arial,sans-serif}#map{position:absolute;inset:0}.toolbar{position:absolute;z-index:500;top:14px;left:14px;display:flex;gap:8px;align-items:center;padding:10px 12px;background:#fff;border-radius:12px;box-shadow:0 3px 18px #0003}.toolbar input{width:90px;padding:8px;border:1px solid #ccd2dc;border-radius:7px}.toolbar button{padding:8px 12px;border:0;border-radius:7px;background:#5144bd;color:#fff;cursor:pointer}.toolbar label{display:flex;align-items:center;gap:6px}.status{position:absolute;z-index:600;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(540px,90vw);padding:18px 22px;background:#202431;color:white;border-radius:12px;box-shadow:0 5px 25px #0004;text-align:center}.status.error{background:#7c2525}.balloon{max-width:300px;overflow-wrap:anywhere;line-height:1.55}.balloon a{color:#185abc}.legend{font-size:12px;color:#555}.fake{color:#a65c00}
+</style>
+<script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU"></script>
+</head><body>
+<div id="map"></div><div class="toolbar"><label>Год <input id="year" type="text" inputmode="numeric" placeholder="например 2024"></label><button id="load">Загрузить</button><span class="legend">● GPS &nbsp; ◉ приблизительная точка</span></div><div id="status" class="status">Инициализация карты…</div>
+<script>
+'use strict';
+const status=document.getElementById('status'); let map, clusterer, lineLayer, loadRequest=0;
+function message(text,error=false){status.textContent=text;status.classList.toggle('error',error);status.hidden=false}
+function clearStatus(){status.hidden=true}
+function safeUrl(path){return path.split('/').map(encodeURIComponent).join('/')}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function validPoint(p){return p&&Number.isFinite(Number(p.lat))&&Number.isFinite(Number(p.lon))&&Math.abs(Number(p.lat))<=90&&Math.abs(Number(p.lon))<=180}
+function init(){
+ map=new ymaps.Map('map',{center:[55.75,37.61],zoom:5,controls:['zoomControl','fullscreenControl']},{suppressMapOpenBlock:true});
+ clusterer=new ymaps.Clusterer({preset:'islands#invertedVioletClusterIcons',groupByCoordinates:false,gridSize:64});
+ lineLayer=new ymaps.GeoObjectCollection();map.geoObjects.add(lineLayer);
+ document.getElementById('load').addEventListener('click',loadYear);
+ document.getElementById('year').addEventListener('keydown',e=>{if(e.key==='Enter')loadYear()});
+ const params=new URLSearchParams(location.search);document.getElementById('year').value=params.get('year')||new Date().getFullYear();loadYear();
+}
+async function loadYear(){
+ const requestId=++loadRequest;
+ const year=document.getElementById('year').value.trim();if(!/^\d{4}$/.test(year)&&year!=='unknown'){message('Укажите год в формате YYYY или unknown.',true);return}
+ message(`Загрузка points_${year}.json…`);clusterer.removeAll();lineLayer.removeAll();
+ try{
+  const response=await fetch(`points_${encodeURIComponent(year)}.json`,{cache:'no-cache'});if(requestId!==loadRequest)return;if(!response.ok)throw new Error(`Не удалось загрузить points_${year}.json (HTTP ${response.status}).`);
+  const data=await response.json();if(requestId!==loadRequest)return;if(!data||!Array.isArray(data.points))throw new Error('Некорректный JSON: ожидался объект с массивом points.');
+  const points=data.points;const validEntries=points.map((p,index)=>({p,index})).filter(x=>validPoint(x.p));if(!validEntries.length){message('В этом файле нет точек с корректными координатами.');return}
+  const objects=validEntries.map(({p,index})=>{const filename=String(p.file||'');const basename=filename.split('/').pop()||filename;const pos=[Number(p.lat),Number(p.lon)];const fake=Boolean(p.fake);const pathUrl=`photo-path.html?year=${encodeURIComponent(year)}&index=${index}`;
+   return new ymaps.Placemark(pos,{balloonContentHeader:fake?'Приблизительное местоположение':'Фотография',balloonContentBody:`<div class="balloon"><b>Координаты:</b> ${pos[0].toFixed(6)}, ${pos[1].toFixed(6)}<br><b>Дата:</b> ${escapeHtml(p.timestamp||'не указана')}<br><b>Файл:</b> <a href="${escapeHtml(safeUrl(filename))}" target="_blank" rel="noopener">${escapeHtml(basename)}</a><br><small>${escapeHtml(filename)}</small><br><a href="${escapeHtml(pathUrl)}" target="_blank" rel="noopener">Открыть файлы псевдопути и навигацию →</a>${fake?'<br><span class="fake">Точка примерная, координаты синтезированы.</span>':''}</div>`,hintContent:basename},{preset:fake?'islands#orangeCircleDotIcon':'islands#violetDotIcon'});
+  });
+  clusterer.add(objects);map.geoObjects.add(clusterer);
+  // paths содержит индексы точек в массиве points из генератора.
+  if(Array.isArray(data.paths))for(const path of data.paths){if(!Array.isArray(path)||path.length<2)continue;const coords=path.map(i=>Number.isInteger(i)?points[i]:null).filter(validPoint).map(p=>[Number(p.lat),Number(p.lon)]);if(coords.length>=2)lineLayer.add(new ymaps.Polyline(coords,{}, {strokeColor:'#5144bd99',strokeWidth:3,strokeOpacity:.55}))}
+  const bounds=map.geoObjects.getBounds();if(bounds)map.setBounds(bounds,{checkZoomRange:true,zoomMargin:35});
+  history.replaceState(null,'',`?year=${encodeURIComponent(year)}`);message(`Загружено точек: ${validEntries.length}${validEntries.length!==points.length?` (пропущено некорректных: ${points.length-validEntries.length})`:''}.`);setTimeout(clearStatus,2200);
+ }catch(e){
+  if(requestId!==loadRequest)return;
+  let detail=e.message;
+  if(/HTTP 404/.test(detail)){
+   try{const dir=await fetch('./');if(dir.ok){const html=await dir.text();const available=[...html.matchAll(/href=["'](points_(?:\\d{4}|unknown)\\.json)["']/gi)].map(m=>m[1]);if(available.length)detail+=` Доступные файлы: ${[...new Set(available)].join(', ')}. Введите год из имени файла.`;else detail+=' Проверьте, что скрипт Python уже создал points_<год>.json в этой папке.'}}catch{}
+  }
+  message(`${detail} Запустите сервер в папке с файлами: python -m http.server 8000`,true);console.error(e)
+ }
+}
+if(window.ymaps)ymaps.ready(init);else message('Не удалось загрузить API Яндекс Карт. Проверьте подключение к интернету и API-ключ.',true);
+</script><script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4c6f63dfe49f121',t:'MTc5MjMyMDQxNA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body></html>
