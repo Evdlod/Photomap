@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import random
@@ -6,7 +7,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 # Внимание: отключение лимита разрешено для доверенных панорам, но повышает
 # риск чрезмерного расхода памяти на повреждённых/вредоносных файлах.
@@ -15,6 +16,11 @@ Image.MAX_IMAGE_PIXELS = None
 EXTENSIONS = ('.jpg', '.jpeg', '.tif', '.tiff', '.webp', '.png', '.heic', '.heif')
 MAX_PATH_GAP = timedelta(hours=1)
 MAX_PATH_DISTANCE_M = 1000.0
+
+# Миниатюры: папка рядом с данными, максимальный размер по ширине и высоте.
+THUMB_DIR_NAME = 'ico'
+THUMB_MAX_SIZE = 240
+THUMB_QUALITY = 85
 
 
 def dms_to_dd(dms, ref):
@@ -89,6 +95,61 @@ def get_metadata(path):
     return lat, lon, timestamp
 
 
+def plan_thumbnails(files, root_dir):
+    """Планирует имена миниатюр, повторяя структуру папок исходных файлов.
+
+    Возвращает словарь {исходный файл: путь миниатюры относительно папки ico}.
+    Расширение всегда .jpg — иначе браузер не покажет HEIC/TIFF/PNG-исходник.
+    Если в папке есть файлы с одинаковым именем, но разными расширениями
+    (a.jpg и a.png), к имени добавляется исходное расширение.
+    """
+    by_dir = defaultdict(list)
+    for path in files:
+        by_dir[os.path.dirname(path)].append(path)
+
+    plan = {}
+    for group in by_dir.values():
+        by_stem = defaultdict(list)
+        for path in group:
+            by_stem[os.path.splitext(os.path.basename(path))[0].lower()].append(path)
+        for stem, same_stem in by_stem.items():
+            for path in same_stem:
+                base = os.path.basename(path)
+                ext = base.rsplit('.', 1)[-1].lower() if '.' in base else ''
+                thumb_name = f'{stem}.jpg' if len(same_stem) == 1 else f'{stem}_{ext}.jpg'
+                rel = os.path.relpath(path, root_dir).replace('\\', '/')
+                sub = os.path.dirname(rel)
+                plan[path] = f'{sub}/{thumb_name}' if sub else thumb_name
+    return plan
+
+
+def make_thumbnail(source_path, dest_path, max_size=THUMB_MAX_SIZE):
+    """Создаёт уменьшенную копию: не более max_size пикселей по ширине и высоте.
+
+    Ориентация EXIF учитывается, прозрачность заливается белым. Возвращает
+    True, если миниатюра создана.
+    """
+    try:
+        with Image.open(source_path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGBA')
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[-1])
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+            parent = os.path.dirname(dest_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            img.save(dest_path, 'JPEG', quality=THUMB_QUALITY, optimize=True)
+            return True
+    except Exception as exc:
+        print(f'⚠️ Не удалось создать миниатюру {source_path}: {exc}', file=sys.stderr)
+        return False
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     """Расстояние между координатами по дуге большого круга, в метрах."""
     from math import asin, cos, radians, sin, sqrt
@@ -146,7 +207,27 @@ def build_paths(points):
     return paths
 
 
-def main(root_dir='.'):
+def build_thumbnails(files, root_dir, thumbs_root, thumb_size):
+    """Создаёт миниатюры и возвращает {исходный файл: путь миниатюры для JSON}."""
+    url_prefix = os.path.relpath(thumbs_root, root_dir).replace('\\', '/')
+    if url_prefix == '.':
+        url_prefix = ''
+
+    plan = plan_thumbnails(files, root_dir)
+    print(f'🖼️  Создаю миниатюры (не более {thumb_size} px) в {thumbs_root}...')
+    result = {}
+    milestones = {max(1, int(len(plan) * p / 100)) for p in range(10, 101, 10)}
+    for index, (path, rel_thumb) in enumerate(plan.items(), 1):
+        if index in milestones:
+            print(f'⏳ Прогресс миниатюр: {int(index / len(plan) * 100)}%')
+        dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
+        if make_thumbnail(path, dest, thumb_size):
+            rel_file = os.path.relpath(path, root_dir).replace('\\', '/')
+            result[rel_file] = f'{url_prefix}/{rel_thumb}' if url_prefix else rel_thumb
+    return result
+
+
+def main(root_dir='.', thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True):
     root_dir = os.path.abspath(root_dir)
     print('🔍 Подсчет файлов...')
     files = []
@@ -161,6 +242,16 @@ def main(root_dir='.'):
     if not total:
         print('Изображения не найдены; JSON-файлы не созданы.')
         return
+
+    thumbs = {}
+    thumbs_root = None
+    if make_thumbs:
+        thumbs_root = (os.path.abspath(thumbs_dir) if thumbs_dir
+                       else os.path.join(root_dir, THUMB_DIR_NAME))
+        thumbs = build_thumbnails(files, root_dir, thumbs_root, thumb_size)
+        print(f'🖼️  Миниатюр создано: {len(thumbs)} из {total}')
+    else:
+        print('🖼️  Миниатюры отключены (--no-thumbs).')
 
     print('⚙️ Извлечение метаданных...')
     all_items = []
@@ -209,16 +300,23 @@ def main(root_dir='.'):
         points_out = []
         for item in items:
             if item['lat'] is not None and item['lon'] is not None:
-                points_out.append({
+                point = {
                     'lat': item['lat'], 'lon': item['lon'], 'file': item['file'],
                     'timestamp': item['timestamp'].isoformat() if item['timestamp'] else None,
                     'fake': False,
-                })
+                }
+                # Поле добавляется только при наличии миниатюры: старые клиенты его не знают.
+                if thumbs.get(item['file']):
+                    point['thumb'] = thumbs[item['file']]
+                points_out.append(point)
         for point in fake_points:
-            points_out.append({
+            entry = {
                 'lat': point['lat'], 'lon': point['lon'], 'file': point['file'],
                 'timestamp': point['timestamp'].isoformat(), 'fake': True,
-            })
+            }
+            if thumbs.get(point['file']):
+                entry['thumb'] = thumbs[point['file']]
+            points_out.append(entry)
 
         # Сортировка до построения линий гарантирует последовательность по времени.
         points_out.sort(key=lambda point: point['timestamp'] or '')
@@ -235,7 +333,26 @@ def main(root_dir='.'):
               f'{fake_count} фейковых точек, {len(paths)} путей')
 
     print('\n✅ Готово! Откройте map.html через локальный сервер.')
+    if thumbs_root:
+        print(f'🖼️  Миниатюры: {thumbs_root} (ссылки из JSON ведут на '
+              f'{os.path.relpath(thumbs_root, root_dir).replace(os.sep, "/")}/)')
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description='Сканирует фотографии, строит фото-карту и псевдопути.')
+    parser.add_argument('root', nargs='?', default='.',
+                        help='папка с фотографиями (по умолчанию — текущая)')
+    parser.add_argument('--thumbs-dir', default=None,
+                        help=f'папка для миниатюр (по умолчанию <root>/{THUMB_DIR_NAME})')
+    parser.add_argument('--thumb-size', type=int, default=THUMB_MAX_SIZE,
+                        help='максимальный размер миниатюры по ширине и высоте, px')
+    parser.add_argument('--no-thumbs', action='store_true',
+                        help='не создавать миниатюры')
+    return parser.parse_args(argv)
 
 
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else '.')
+    args = parse_args(sys.argv[1:])
+    main(args.root, thumbs_dir=args.thumbs_dir, thumb_size=args.thumb_size,
+         make_thumbs=not args.no_thumbs)
