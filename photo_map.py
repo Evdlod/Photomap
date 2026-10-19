@@ -8,11 +8,14 @@ import sys
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
 
 # Внимание: отключение лимита разрешено для доверенных панорам, но повышает
 # риск чрезмерного расхода памяти на повреждённых/вредоносных файлах.
 Image.MAX_IMAGE_PIXELS = None
+# Битой папке архива лучше миниатюра с серой заливкой в повреждённом месте,
+# чем полностью пропущенный снимок: включаем дозагрузку обрезанных JPEG.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 EXTENSIONS = ('.jpg', '.jpeg', '.tif', '.tiff', '.webp', '.png', '.heic', '.heif')
 MAX_PATH_GAP = timedelta(hours=1)
@@ -25,6 +28,8 @@ THUMB_QUALITY = 85
 
 # Журнал ошибок и пробный прогон.
 LOG_FILE_NAME = 'photo_map.log'
+CACHE_FILE_NAME = 'photo_map.cache.json'
+CACHE_VERSION = 1
 TEST_DIR_NAME = 'test_run'
 TEST_FILE_LIMIT = 1000
 PROGRESS_STEP = 5          # шаг вывода прогресса, процентов
@@ -102,21 +107,50 @@ class RunLog:
 DEFAULT_LOG = RunLog()
 
 
+def format_duration(seconds):
+    """'1 ч 12 мин', '3 мин 05 с' — для оценки оставшегося времени."""
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f'{hours} ч {minutes:02d} мин'
+    if minutes:
+        return f'{minutes} мин {secs:02d} с'
+    return f'{secs} с'
+
+
 def progress_printer(label, total, step=PROGRESS_STEP):
     """Возвращает функцию: печатает прогресс шагами по step% от ожидаемого объёма.
 
     Шаг считается от предполагаемого количества (total), поэтому для 1000 файлов
-    строка появляется каждые 50 файлов: 5%, 10%, …, 100%.
+    строка появляется каждые 50 файлов: 5%, 10%, …, 100%. Рядом печатаются
+    скорость и оценка остатка — чтобы длинная обработка не выглядела зависанием.
     """
     every = max(1, int(round(total * step / 100)))
     printed = 0
+    started = datetime.now()
+    last_print = started
 
     def report(index):
-        nonlocal printed
-        if (index % every == 0 or index >= total) and index != printed:
-            printed = index
-            percent = min(100, round(index * 100 / total))
-            print(f'⏳ {label}: {percent}% ({index} из {total})')
+        nonlocal printed, last_print
+        now = datetime.now()
+        due_by_step = (index % every == 0 or index >= total) and index != printed
+        # Если очередной шаг далеко (сотни тысяч файлов), раз в минуту
+        # печатаем строку, чтобы работа не выглядела зависанием.
+        due_by_time = (now - last_print).total_seconds() >= 60
+        if not (due_by_step or due_by_time):
+            return
+        printed = index
+        last_print = now
+        percent = min(100, round(index * 100 / total))
+        elapsed = max(0.001, (now - started).total_seconds())
+        rate = index / elapsed
+        tail = ''
+        if elapsed > 2 and index < total and rate > 0:
+            remaining = (total - index) / rate
+            if remaining >= 1:
+                tail = f' — {rate:.1f} файлов/с, осталось ~{format_duration(remaining)}'
+        print(f'⏳ {label}: {percent}% ({index} из {total}){tail}')
 
     return report
 
@@ -388,6 +422,13 @@ def make_thumbnail(source_path, dest_path, max_size=THUMB_MAX_SIZE, log=None, fo
     tmp_path = dest_path + '.tmp'
     try:
         with Image.open(source_path) as img:
+            # JPEG умеет декодироваться сразу в уменьшенном масштабе (1/2, 1/4, 1/8):
+            # для миниатюры 240 px полный кадр 4000 px разбирать незачем.
+            if img.format == 'JPEG':
+                try:
+                    img.draft('RGB', (max_size * 2, max_size * 2))
+                except Exception:
+                    pass
             img = ImageOps.exif_transpose(img)
             if img.mode in ('RGBA', 'LA', 'P'):
                 img = img.convert('RGBA')
@@ -471,6 +512,55 @@ def build_paths(points):
     return paths
 
 
+def load_metadata_cache(path):
+    """Кэш метаданных: {путь: [размер, mtime_ns, широта, долгота, дата, источник]}.
+
+    Чтение EXIF — самая дорогая операция после миниатюр: на 200+ тысячах
+    снимков с облачного диска это часы. Для неизменившихся файлов (совпали
+    размер и время изменения) метаданные берутся из кэша, файл не открывается.
+    """
+    try:
+        with open(path, encoding='utf-8') as file_obj:
+            data = json.load(file_obj)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get('version') != CACHE_VERSION:
+        return {}
+    files = data.get('files')
+    return files if isinstance(files, dict) else {}
+
+
+def save_metadata_cache(path, files):
+    """Атомарно сохраняет кэш метаданных."""
+    tmp_path = path + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as file_obj:
+            json.dump({'version': CACHE_VERSION, 'files': files}, file_obj,
+                      ensure_ascii=False, separators=(',', ':'))
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def cached_metadata(entry, rel_path):
+    """Восстанавливает Metadata из записи кэша или возвращает None."""
+    if not isinstance(entry, (list, tuple)) or len(entry) < 6:
+        return None
+    timestamp = None
+    if entry[4]:
+        try:
+            timestamp = datetime.fromisoformat(entry[4])
+        except (TypeError, ValueError):
+            return None
+    return Metadata(entry[2], entry[3], timestamp, entry[5], None)
+
+
 def index_thumbnails(thumbs_root):
     """Собирает готовые миниатюры одним проходом по папке ico.
 
@@ -541,6 +631,60 @@ def explain_root_mismatch(existing, plan):
     prefix, found, expected = samples[0]
     return (f'Есть похожая миниатюра {found}, а ожидается {expected}. '
             f'Похоже, ico создавалась для другой корневой папки.')
+
+
+def find_reusable_thumbs(root_dir, thumbs_root, plan, needed):
+    """Ищет готовые миниатюры в ico родительской папки.
+
+    Типичная ситуация: раньше сканировали `...new1`, миниатюры легли в
+    `...new1/ico/Альбомы по годам/...`, а теперь корень —
+    `...new1/Альбомы по годам`. Пути в новой ico не совпадают, хотя сами
+    файлы уже есть. Здесь они находятся и переиспользуются копированием —
+    это в разы быстрее, чем заново декодировать полноразмерные снимки
+    из облачной папки.
+
+    Возвращает {нормализованный rel_thumb: полный путь к готовому файлу}.
+    """
+    found = {}
+    if not needed:
+        return found
+    root_abs = os.path.abspath(root_dir)
+    parent_ico = os.path.join(os.path.dirname(root_abs), THUMB_DIR_NAME)
+    if not os.path.isdir(parent_ico):
+        return found
+    if os.path.normcase(parent_ico) == os.path.normcase(os.path.abspath(thumbs_root)):
+        return found
+
+    by_name = {}
+    for rel in needed:
+        by_name.setdefault(os.path.normcase(rel.rsplit('/', 1)[-1]), []).append(rel)
+
+    stack = [parent_ico]
+    while stack and len(found) < len(needed):
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.name.lower().endswith('.jpg'):
+                            continue
+                        if entry.stat().st_size <= 0:
+                            continue
+                    except OSError:
+                        continue
+                    for rel in by_name.get(os.path.normcase(entry.name), ()):
+                        if os.path.normcase(rel) in found:
+                            continue
+                        rel_found = os.path.relpath(entry.path, parent_ico)
+                        rel_found = rel_found.replace('\\', '/')
+                        if os.path.normcase(rel_found).endswith('/' + os.path.normcase(rel)):
+                            found[os.path.normcase(rel)] = entry.path
+        except OSError:
+            continue
+    return found
 
 
 def find_thumb_migration_hint(root_dir, thumbs_root, plan):
@@ -624,11 +768,26 @@ def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
     existing = index_thumbnails(thumbs_root)
     ready = 0 if force else sum(1 for rel in plan.values()
                                 if os.path.normcase(rel) in existing)
-    todo = len(plan) - ready
-    print(f'   готово: {ready}, создать: {todo}'
-          + (' (--force-thumbs: пересоздаём всё)' if force else ''))
-    log.info(f'Миниатюры: план {len(plan)}, готово {ready}, создать {todo}')
-    if todo and not ready and not force:
+    missing = [rel for rel in plan.values() if os.path.normcase(rel) not in existing]
+    reusable = {} if force else find_reusable_thumbs(root_dir, thumbs_root, plan, missing)
+    todo = len(missing) - len(reusable)
+    summary = f'   готово: {ready}'
+    if reusable:
+        summary += f', возьму из старой ico: {len(reusable)}'
+    summary += f', создать: {todo}'
+    if force:
+        summary += ' (--force-thumbs: пересоздаём всё)'
+    print(summary)
+    log.info(f'Миниатюры: план {len(plan)}, готово {ready}, '
+             f'переиспользую {len(reusable)}, создать {todo}')
+    if reusable:
+        note = ('Нашёл готовые миниатюры в ico родительской папки — копирую их '
+                'вместо повторной генерации. После успешного прогона старую '
+                f'папку {os.path.join(os.path.dirname(os.path.abspath(root_dir)), THUMB_DIR_NAME)} '
+                'можно удалить.')
+        print(f'💡 {note}')
+        log.info(note)
+    if todo and not ready and not reusable and not force:
         hint = explain_root_mismatch(existing, plan) or \
             find_thumb_migration_hint(root_dir, thumbs_root, plan)
         if hint:
@@ -637,14 +796,29 @@ def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
 
     report = progress_printer('Миниатюры', len(plan))
     result = {}
-    stats = {'created': 0, 'skipped': 0, 'failed': 0}
+    stats = {'created': 0, 'skipped': 0, 'reused': 0, 'failed': 0}
     for index, (path, rel_thumb) in enumerate(plan.items(), 1):
         key = os.path.normcase(rel_thumb)
+        dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
         if not force and key in existing:
             # Файл уже есть — источник не открываем вообще.
             status = 'skipped'
+        elif not force and key in reusable:
+            # Готовая миниатюра из старой папки: копируем, снимок не открываем.
+            try:
+                parent = os.path.dirname(dest)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                shutil.copy2(reusable[key], dest)
+                status = 'reused'
+                existing[key] = rel_thumb
+            except OSError as exc:
+                log.warning(f'Не удалось скопировать миниатюру '
+                            f'{reusable[key]}: {exc}')
+                status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
+                if status == 'created':
+                    existing[key] = rel_thumb
         else:
-            dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
             status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
             if status == 'created':
                 existing[key] = rel_thumb
@@ -678,7 +852,7 @@ def resolve_root(root_dir):
 
 
 def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True,
-         log_path=None, force_thumbs=False, test_limit=None):
+         log_path=None, force_thumbs=False, test_limit=None, no_cache=False):
     started = datetime.now()
     used_default = not root_dir
     root_dir = resolve_root(root_dir)
@@ -743,8 +917,10 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
     if make_thumbs:
         thumbs, stats = build_thumbnails(files, root_dir, thumbs_root, thumb_size,
                                          url_base=out_dir, log=log, force=force_thumbs)
-        summary = (f'создано {stats["created"]}, уже были {stats["skipped"]}, '
-                   f'ошибок {stats["failed"]}')
+        summary = f'создано {stats["created"]}, уже были {stats["skipped"]}'
+        if stats['reused']:
+            summary += f', скопировано из старой ico {stats["reused"]}'
+        summary += f', ошибок {stats["failed"]}'
         print(f'🖼️  Миниатюры: {summary}')
         log.info(f'Миниатюры: {summary}')
     else:
@@ -754,16 +930,51 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
     all_items = []
     date_sources = {}
     folder_dates = {}
+    cache_path = os.path.join(out_dir, CACHE_FILE_NAME)
+    cache = {} if no_cache else load_metadata_cache(cache_path)
+    if cache:
+        print(f'💾 Кэш метаданных: {len(cache)} записей ({cache_path})')
+    new_cache = {}
+    cache_hits = 0
     report = progress_printer('Метаданные', total)
     for index, path in enumerate(files, 1):
-        meta = get_metadata(path, log=log, root_dir=root_dir)
+        rel_path = os.path.relpath(path, out_dir).replace('\\', '/')
+        meta = None
+        signature = None
+        try:
+            stat = os.stat(path)
+            signature = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            stat = None
+        if signature and not no_cache:
+            entry = cache.get(rel_path)
+            if entry and len(entry) >= 2 and entry[0] == signature[0] \
+                    and entry[1] == signature[1]:
+                meta = cached_metadata(entry, rel_path)
+                if meta is not None:
+                    cache_hits += 1
+        if meta is None:
+            meta = get_metadata(path, log=log, root_dir=root_dir)
+        if signature:
+            new_cache[rel_path] = [
+                signature[0], signature[1], meta.lat, meta.lon,
+                meta.timestamp.isoformat() if meta.timestamp else None, meta.source,
+            ]
         date_sources[meta.source] = date_sources.get(meta.source, 0) + 1
         if meta.source == 'folder':
             folder_dates.setdefault(meta.folder, meta.timestamp)
-        rel_path = os.path.relpath(path, out_dir).replace('\\', '/')
         all_items.append({'lat': meta.lat, 'lon': meta.lon,
                           'timestamp': meta.timestamp, 'file': rel_path})
         report(index)
+
+    if not no_cache:
+        if save_metadata_cache(cache_path, new_cache):
+            print(f'💾 Метаданные в кэше: {len(new_cache)} '
+                  f'(без чтения файлов: {cache_hits})')
+        else:
+            print('⚠️  Не удалось сохранить кэш метаданных.')
+    if cache_hits:
+        print(f'   Файлов, прочитанных заново: {len(files) - cache_hits}')
 
     labels = {'exif': 'EXIF/XMP', 'folder': 'по папке', 'mtime': 'mtime', None: 'без даты'}
     summary = ', '.join(f'{labels.get(key, key)}: {value}'
@@ -883,6 +1094,8 @@ def parse_args(argv):
                         help='не создавать миниатюры')
     parser.add_argument('--force-thumbs', action='store_true',
                         help='пересоздать миниатюры, даже если файлы уже есть')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='не использовать кэш метаданных (перечитать EXIF у всех файлов)')
     parser.add_argument('--log', default=None, metavar='ФАЙЛ',
                         help=f'файл журнала (по умолчанию <root>/{LOG_FILE_NAME})')
     parser.add_argument('--test', nargs='?', type=int, const=TEST_FILE_LIMIT,
@@ -898,4 +1111,5 @@ if __name__ == '__main__':
     args = parse_args(sys.argv[1:])
     sys.exit(main(args.root, thumbs_dir=args.thumbs_dir, thumb_size=args.thumb_size,
                   make_thumbs=not args.no_thumbs, log_path=args.log,
-                  force_thumbs=args.force_thumbs, test_limit=args.test) or 0)
+                  force_thumbs=args.force_thumbs, test_limit=args.test,
+                  no_cache=args.no_cache) or 0)
