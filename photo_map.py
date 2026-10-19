@@ -4,7 +4,9 @@ import os
 import random
 import re
 import shutil
+import sqlite3
 import sys
+import time
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 
@@ -30,6 +32,11 @@ THUMB_QUALITY = 85
 LOG_FILE_NAME = 'photo_map.log'
 CACHE_FILE_NAME = 'photo_map.cache.json'
 CACHE_VERSION = 1
+
+# Внешняя папка с уже готовыми миниатюрами и её индекс в SQLite.
+DEFAULT_THUMB_SOURCE_DIR = r'D:\YandexDisk\ico'
+THUMB_INDEX_FILE_NAME = 'photo_map_thumbs.sqlite3'
+SAMPLE_THUMBS = 5          # сколько миниатюр сделать «на пробу» для оценки времени
 TEST_DIR_NAME = 'test_run'
 TEST_FILE_LIMIT = 1000
 PROGRESS_STEP = 5          # шаг вывода прогресса, процентов
@@ -51,6 +58,205 @@ def _configure_console():
         except (AttributeError, ValueError, OSError):
             pass
 
+
+def format_spent(seconds):
+    """Длительность этапа с точностью, полезной при разборе «где тормозит»."""
+    if seconds < 1:
+        return f'{seconds * 1000:.0f} мс'
+    if seconds < 60:
+        return f'{seconds:.1f} с'
+    return format_duration(seconds)
+
+
+class StageReporter:
+    """Пошаговая телеметрия: что делаем, сколько запланировано, сколько заняло.
+
+    Нужна, чтобы по выводу было видно, на каком этапе программа тормозит,
+    и чтобы перед каждым этапом было объявлено, что именно будет сделано.
+    """
+
+    def __init__(self, total_stages, log=None):
+        self.index = 0
+        self.total = total_stages
+        self.log = log
+        self.timings = []
+        self._started = 0.0
+        self._title = ''
+
+    def start(self, title, plan=None):
+        self.index += 1
+        self._title = title
+        print(f'\n▶️  Этап {self.index}/{self.total}. {title}')
+        if plan:
+            print(f'   план: {plan}')
+        if self.log:
+            self.log.info(f'Этап {self.index}/{self.total}: {title}; план: {plan or "-"}')
+        self._started = time.monotonic()
+
+    def note(self, text):
+        print(f'   {text}')
+        if self.log:
+            self.log.info(f'Этап {self.index}: {text}')
+
+    def finish(self, details=None):
+        spent = time.monotonic() - self._started
+        if details:
+            print(f'   {details}')
+        print(f'   ✔ заняло {format_spent(spent)}')
+        if self.log:
+            self.log.info(f'Этап {self.index} завершён за {format_spent(spent)}'
+                          + (f'; {details}' if details else ''))
+        self.timings.append((self.index, self._title, spent))
+
+    def summary(self):
+        if not self.timings:
+            return
+        total = sum(item[2] for item in self.timings) or 1e-9
+        print('\n⏱️  Где потрачено время:')
+        for number, title, spent in self.timings:
+            share = spent / total * 100
+            bar = '█' * max(1, round(share / 4))
+            print(f'   {number}. {title:<44} {format_spent(spent):>12}  '
+                  f'{share:5.1f}%  {bar}')
+        print(f'   {"итого":<48} {format_spent(total):>12}')
+
+
+class ThumbIndex:
+    """Список готовых миниатюр из внешних папок ico, с кэшем в SQLite.
+
+    Сканирование 220 тысяч файлов в 5900 папках — сама по себе небыстрая
+    операция, особенно на облачном диске. Поэтому список сохраняется в
+    SQLite и переиспользуется: повторно папка обходится только если
+    изменилось время её изменения или указан --rescan-thumbs.
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.by_name = {}       # имя в нижнем регистре -> [(source_root, rel)]
+        self.loaded = False
+        self.name_only_hits = 0  # имя нашлось, а путь в структуре — нет
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('CREATE TABLE IF NOT EXISTS meta '
+                     '(key TEXT PRIMARY KEY, value TEXT)')
+        conn.execute('CREATE TABLE IF NOT EXISTS files ('
+                     'source TEXT, name TEXT, rel TEXT, size INTEGER, '
+                     'PRIMARY KEY (source, name, rel))')
+        conn.execute('CREATE INDEX IF NOT EXISTS files_name ON files(name)')
+        return conn
+
+    def scan(self, source_root, force=False, progress=None):
+        """Обходит source_root и обновляет список в БД.
+
+        Возвращает (файлов, папок, из_кэша) или None, если папки нет.
+        """
+        if not source_root or not os.path.isdir(source_root):
+            return None
+        source_root = os.path.abspath(source_root)
+        conn = self._connect()
+        try:
+            stamp = str(os.stat(source_root).st_mtime_ns)
+            key_mtime = f'{source_root}|mtime'
+            key_files = f'{source_root}|files'
+            key_dirs = f'{source_root}|dirs'
+            row = conn.execute('SELECT value FROM meta WHERE key=?',
+                               (key_mtime,)).fetchone()
+            if row and row[0] == stamp and not force:
+                files_row = conn.execute('SELECT value FROM meta WHERE key=?',
+                                         (key_files,)).fetchone()
+                dirs_row = conn.execute('SELECT value FROM meta WHERE key=?',
+                                        (key_dirs,)).fetchone()
+                if files_row and dirs_row:
+                    return int(files_row[0]), int(dirs_row[0]), True
+
+            rows = []
+            dirs = 0
+            started = time.monotonic()
+            last_report = started
+            stack = [source_root]
+            while stack:
+                current = stack.pop()
+                dirs += 1
+                now = time.monotonic()
+                if progress and (dirs % 100 == 0 or now - last_report >= 2):
+                    last_report = now
+                    progress(dirs, len(rows), now - started)
+                try:
+                    with os.scandir(current) as entries:
+                        for entry in entries:
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    stack.append(entry.path)
+                                    continue
+                                if not entry.name.lower().endswith('.jpg'):
+                                    continue
+                                stat = entry.stat()
+                                if stat.st_size <= 0:
+                                    continue
+                            except OSError:
+                                continue
+                            rel = os.path.relpath(entry.path, source_root)
+                            rows.append((source_root, entry.name.lower(),
+                                         rel.replace('\\', '/'), stat.st_size))
+                except OSError:
+                    continue
+
+            with conn:
+                conn.execute('DELETE FROM files WHERE source=?', (source_root,))
+                conn.executemany(
+                    'INSERT OR REPLACE INTO files (source, name, rel, size) '
+                    'VALUES (?, ?, ?, ?)', rows)
+                conn.executemany(
+                    'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
+                    [(key_mtime, stamp), (key_files, str(len(rows))),
+                     (key_dirs, str(dirs))])
+            return len(rows), dirs, False
+        finally:
+            conn.close()
+
+    def load(self):
+        """Загружает весь список в память: имя -> [(папка-источник, путь)]."""
+        if self.loaded:
+            return len(self.by_name)
+        self.by_name = {}
+        if not os.path.isfile(self.db_path):
+            self.loaded = True
+            return 0
+        conn = self._connect()
+        try:
+            for source, name, rel in conn.execute(
+                    'SELECT source, name, rel FROM files'):
+                self.by_name.setdefault(name, []).append((source, rel))
+        finally:
+            conn.close()
+        self.loaded = True
+        return len(self.by_name)
+
+    def match(self, rel_thumb):
+        """Ищет готовую миниатюру для ожидаемого пути, с учётом структуры папок.
+
+        Сравнение регистронезависимое: миниатюры и снимки легко расходятся
+        в регистре (IMG_0001.JPG против img_0001.jpg), а на Windows, где
+        обычно и запускается программа, это один и тот же файл.
+        """
+        name = rel_thumb.rsplit('/', 1)[-1].lower()
+        target = rel_thumb.lower().replace('\\', '/')
+        candidates = self.by_name.get(name, ())
+        for source, rel in candidates:
+            low = rel.lower()
+            # Миниатюра может лежать ровно по ожидаемому пути (ico — сам корень)
+            # или глубже, если в ico сохранён ещё и родительский уровень.
+            if low == target or low.endswith('/' + target):
+                return os.path.join(source, *rel.split('/'))
+        if candidates:
+            self.name_only_hits += 1
+        return None
+
+    def close(self):
+        self.by_name = {}
 
 class RunLog:
     """Журнал работы: ошибки и предупреждения пишутся в файл (UTF-8).
@@ -107,8 +313,25 @@ class RunLog:
 DEFAULT_LOG = RunLog()
 
 
+def plural(number, one, few, many):
+    """'1 папка', '2 папки', '5 папок' — чтобы сообщения читались по-русски."""
+    number = abs(int(number))
+    if number % 10 == 1 and number % 100 != 11:
+        return f'{number} {one}'
+    if 2 <= number % 10 <= 4 and not 12 <= number % 100 <= 14:
+        return f'{number} {few}'
+    return f'{number} {many}'
+
+
+def with_approx(text):
+    """'~5 мин 10 с', но '<1 с' без лишней тильды."""
+    return text if text.startswith('<') else f'~{text}'
+
+
 def format_duration(seconds):
     """'1 ч 12 мин', '3 мин 05 с' — для оценки оставшегося времени."""
+    if 0 <= seconds < 1:
+        return '<1 с'
     seconds = int(max(0, seconds))
     hours, rest = divmod(seconds, 3600)
     minutes, secs = divmod(rest, 60)
@@ -126,7 +349,10 @@ def progress_printer(label, total, step=PROGRESS_STEP):
     строка появляется каждые 50 файлов: 5%, 10%, …, 100%. Рядом печатаются
     скорость и оценка остатка — чтобы длинная обработка не выглядела зависанием.
     """
-    every = max(1, int(round(total * step / 100)))
+    # На малых объёмах шаг 5% — это 1–2 файла, и строка превращается в шум.
+    # Поэтому не чаще, чем раз в 50 файлов (финальные 100% печатаются всегда).
+    every = max(50 if total >= 200 else total + 1,
+                int(round(total * step / 100)))
     printed = 0
     started = datetime.now()
     last_print = started
@@ -134,7 +360,7 @@ def progress_printer(label, total, step=PROGRESS_STEP):
     def report(index):
         nonlocal printed, last_print
         now = datetime.now()
-        due_by_step = (index % every == 0 or index >= total) and index != printed
+        due_by_step = (index % every == 0 and index != printed) or index >= total
         # Если очередной шаг далеко (сотни тысяч файлов), раз в минуту
         # печатаем строку, чтобы работа не выглядела зависанием.
         due_by_time = (now - last_print).total_seconds() >= 60
@@ -149,7 +375,8 @@ def progress_printer(label, total, step=PROGRESS_STEP):
         if elapsed > 2 and index < total and rate > 0:
             remaining = (total - index) / rate
             if remaining >= 1:
-                tail = f' — {rate:.1f} файлов/с, осталось ~{format_duration(remaining)}'
+                tail = (f' — {rate:.1f} файлов/с, осталось '
+                        f'{with_approx(format_duration(remaining))}')
         print(f'⏳ {label}: {percent}% ({index} из {total}){tail}')
 
     return report
@@ -165,9 +392,11 @@ def register_heic_support():
     return True
 
 
-def collect_images(root_dir, excluded_dirs):
+def collect_images(root_dir, excluded_dirs, progress=None):
     """Собирает изображения, не заходя в папки миниатюр и пробных прогонов."""
     files = []
+    started = time.monotonic()
+    last_report = started
     for dirpath, dirnames, filenames in os.walk(root_dir):
         dirnames[:] = [
             name for name in dirnames
@@ -176,6 +405,10 @@ def collect_images(root_dir, excluded_dirs):
         for filename in filenames:
             if filename.lower().endswith(EXTENSIONS):
                 files.append(os.path.join(dirpath, filename))
+        now = time.monotonic()
+        if progress and now - last_report >= 2:
+            last_report = now
+            progress(len(files), now - started)
     files.sort()
     return files
 
@@ -633,60 +866,6 @@ def explain_root_mismatch(existing, plan):
             f'Похоже, ico создавалась для другой корневой папки.')
 
 
-def find_reusable_thumbs(root_dir, thumbs_root, plan, needed):
-    """Ищет готовые миниатюры в ico родительской папки.
-
-    Типичная ситуация: раньше сканировали `...new1`, миниатюры легли в
-    `...new1/ico/Альбомы по годам/...`, а теперь корень —
-    `...new1/Альбомы по годам`. Пути в новой ico не совпадают, хотя сами
-    файлы уже есть. Здесь они находятся и переиспользуются копированием —
-    это в разы быстрее, чем заново декодировать полноразмерные снимки
-    из облачной папки.
-
-    Возвращает {нормализованный rel_thumb: полный путь к готовому файлу}.
-    """
-    found = {}
-    if not needed:
-        return found
-    root_abs = os.path.abspath(root_dir)
-    parent_ico = os.path.join(os.path.dirname(root_abs), THUMB_DIR_NAME)
-    if not os.path.isdir(parent_ico):
-        return found
-    if os.path.normcase(parent_ico) == os.path.normcase(os.path.abspath(thumbs_root)):
-        return found
-
-    by_name = {}
-    for rel in needed:
-        by_name.setdefault(os.path.normcase(rel.rsplit('/', 1)[-1]), []).append(rel)
-
-    stack = [parent_ico]
-    while stack and len(found) < len(needed):
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                            continue
-                        if not entry.name.lower().endswith('.jpg'):
-                            continue
-                        if entry.stat().st_size <= 0:
-                            continue
-                    except OSError:
-                        continue
-                    for rel in by_name.get(os.path.normcase(entry.name), ()):
-                        if os.path.normcase(rel) in found:
-                            continue
-                        rel_found = os.path.relpath(entry.path, parent_ico)
-                        rel_found = rel_found.replace('\\', '/')
-                        if os.path.normcase(rel_found).endswith('/' + os.path.normcase(rel)):
-                            found[os.path.normcase(rel)] = entry.path
-        except OSError:
-            continue
-    return found
-
-
 def find_thumb_migration_hint(root_dir, thumbs_root, plan):
     """Подсказка, если готовые миниатюры лежат в ico родительской папки.
 
@@ -742,51 +921,80 @@ def find_thumb_migration_hint(root_dir, thumbs_root, plan):
             f'Похоже, ico создавалась для другой корневой папки.')
 
 
-def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
-                     url_base=None, log=None, force=False):
-    """Создаёт недостающие миниатюры.
+def plan_thumbnail_work(files, root_dir, thumbs_root, thumb_index=None, force=False):
+    """Сопоставляет снимки с готовыми миниатюрами, ничего не создавая.
 
-    Возвращает ({исходный файл: путь миниатюры для JSON}, статистику по статусам).
-    Готовые миниатюры не пересоздаются, но всё равно попадают в результат,
-    чтобы поле thumb было в JSON и после повторного запуска.
+    Возвращает словарь с планом: что уже на месте, что можно скопировать
+    из внешней ico и что придётся создавать.
+    """
+    plan = plan_thumbnails(files, root_dir)
+    existing = index_thumbnails(thumbs_root)
+    missing = [(rel, path) for path, rel in plan.items()
+               if force or os.path.normcase(rel) not in existing]
+    ready = len(plan) - len(missing)
+
+    reusable = {}
+    if thumb_index is not None and not force:
+        for rel, _ in missing:
+            source = thumb_index.match(rel)
+            if source and os.path.isfile(source):
+                reusable[os.path.normcase(rel)] = source
+
+    return {
+        'plan': plan,
+        'existing': existing,
+        'missing': missing,
+        'reusable': reusable,
+        'ready': ready,
+        'todo': len(missing) - len(reusable),
+    }
+
+
+def build_thumbnails(files, root_dir, thumbs_root, thumb_size, url_base=None,
+                     log=None, force=False, thumb_index=None, stages=None,
+                     work=None):
+    """Создаёт недостающие миниатюры, используя индекс внешних папок ico.
+
+    Возвращает ({исходный файл: путь миниатюры для JSON}, статистику).
+    Готовые миниатюры не пересоздаются, но всё равно попадают в результат.
     """
     log = log or DEFAULT_LOG
     url_base = url_base or root_dir
     try:
         url_prefix = os.path.relpath(thumbs_root, url_base).replace('\\', '/')
     except ValueError:
-        # Windows: папка миниатюр на другом диске, относительную ссылку не построить.
         log.warning(f'Папка миниатюр {thumbs_root} на другом диске: '
                     f'ссылки в JSON будут указывать на {THUMB_DIR_NAME}/')
         url_prefix = THUMB_DIR_NAME
     if url_prefix == '.':
         url_prefix = ''
+    elif url_prefix.startswith('..'):
+        note = (f'Папка миниатюр {thumbs_root} лежит вне корня {url_base}: '
+                f'браузер не покажет такие изображения. Лучше держать ico '
+                f'внутри корня или указать серверу более общую папку.')
+        print(f'⚠️  {note}')
+        log.warning(note)
 
-    plan = plan_thumbnails(files, root_dir)
-    print(f'🖼️  Миниатюры (не более {thumb_size} px) в {thumbs_root}')
-    print('🗂️  Индексирую готовые миниатюры…')
-    existing = index_thumbnails(thumbs_root)
-    ready = 0 if force else sum(1 for rel in plan.values()
-                                if os.path.normcase(rel) in existing)
-    missing = [rel for rel in plan.values() if os.path.normcase(rel) not in existing]
-    reusable = {} if force else find_reusable_thumbs(root_dir, thumbs_root, plan, missing)
-    todo = len(missing) - len(reusable)
-    summary = f'   готово: {ready}'
-    if reusable:
-        summary += f', возьму из старой ico: {len(reusable)}'
-    summary += f', создать: {todo}'
-    if force:
-        summary += ' (--force-thumbs: пересоздаём всё)'
-    print(summary)
-    log.info(f'Миниатюры: план {len(plan)}, готово {ready}, '
-             f'переиспользую {len(reusable)}, создать {todo}')
-    if reusable:
-        note = ('Нашёл готовые миниатюры в ico родительской папки — копирую их '
-                'вместо повторной генерации. После успешного прогона старую '
-                f'папку {os.path.join(os.path.dirname(os.path.abspath(root_dir)), THUMB_DIR_NAME)} '
-                'можно удалить.')
-        print(f'💡 {note}')
-        log.info(note)
+    work = work or plan_thumbnail_work(files, root_dir, thumbs_root,
+                                       thumb_index, force)
+    plan = work['plan']
+    existing = work['existing']
+    missing = work['missing']
+    reusable = work['reusable']
+    ready = work['ready']
+    todo = work['todo']
+
+    if not todo:
+        print('🧭 Решение: создавать нечего — этап генерации миниатюр '
+              'пропускается, все файлы уже есть.')
+    elif todo == len(plan):
+        print(f'🧭 Решение: создавать миниатюры — готовых нет, нужно создать '
+              f'все {len(plan)}.')
+    else:
+        print(f'🧭 Решение: {plural(todo, "миниатюра", "миниатюры", "миниатюр")} '
+              f'создать, {len(plan) - todo} возьмётся готовыми '
+              f'({todo * 100 // max(1, len(plan))}% работы).')
+
     if todo and not ready and not reusable and not force:
         hint = explain_root_mismatch(existing, plan) or \
             find_thumb_migration_hint(root_dir, thumbs_root, plan)
@@ -794,45 +1002,87 @@ def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
             print(f'⚠️  {hint}')
             log.warning(hint)
 
-    report = progress_printer('Миниатюры', len(plan))
-    result = {}
     stats = {'created': 0, 'skipped': 0, 'reused': 0, 'failed': 0}
-    for index, (path, rel_thumb) in enumerate(plan.items(), 1):
-        key = os.path.normcase(rel_thumb)
-        dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
-        if not force and key in existing:
-            # Файл уже есть — источник не открываем вообще.
-            status = 'skipped'
-        elif not force and key in reusable:
-            # Готовая миниатюра из старой папки: копируем, снимок не открываем.
-            try:
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                shutil.copy2(reusable[key], dest)
-                status = 'reused'
-                existing[key] = rel_thumb
-            except OSError as exc:
-                log.warning(f'Не удалось скопировать миниатюру '
-                            f'{reusable[key]}: {exc}')
-                status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
-                if status == 'created':
-                    existing[key] = rel_thumb
-        else:
-            status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
-            if status == 'created':
-                existing[key] = rel_thumb
+    result = {}
+    processed = 0
+    report = progress_printer('Миниатюры', len(plan))
+
+    def register(rel_thumb, path, status):
+        nonlocal processed
         stats[status] += 1
+        processed += 1
+        if status != 'failed':
+            rel_file = os.path.relpath(path, url_base).replace('\\', '/')
+            result[rel_file] = (f'{url_prefix}/{rel_thumb}' if url_prefix
+                                else rel_thumb)
         if status == 'skipped' and stats['skipped'] % SKIP_NOTICE_STEP == 0:
             note = (f'Пропущено уже готовых миниатюр: {stats["skipped"]} '
                     f'(не пересоздаются)')
             print(f'♻️  {note}')
             log.info(note)
-        if status != 'failed':
-            # Ключ совпадает с полем file в JSON: оба считаются от url_base.
-            rel_file = os.path.relpath(path, url_base).replace('\\', '/')
-            result[rel_file] = f'{url_prefix}/{rel_thumb}' if url_prefix else rel_thumb
-        report(index)
+        report(processed)
+
+    def create(rel, path):
+        # make_thumbnail сам решает, нужно ли работать: если файл уже есть
+        # и не задан force, исходник не открывается вообще.
+        dest = os.path.join(thumbs_root, *rel.split('/'))
+        status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
+        if status == 'created':
+            existing[os.path.normcase(rel)] = rel
+        return status
+
+    # 3. Пробный замер на нескольких файлах — чтобы объявить оценку времени.
+    pending = [(rel, path) for rel, path in missing
+               if os.path.normcase(rel) not in reusable]
+    sample_keys = set()
+    if pending:
+        sample = pending[:min(SAMPLE_THUMBS, len(pending))]
+        started = time.monotonic()
+        made = 0
+        for rel, path in sample:
+            status = create(rel, path)
+            if status == 'created':
+                made += 1
+            sample_keys.add(os.path.normcase(rel))
+            register(rel, path, status)
+        spent = time.monotonic() - started
+        if made and spent > 0:
+            rate = made / spent
+            estimate = (len(pending) - made) / rate
+            print(f'⏱️  Замер: {made} миниатюр за {spent:.1f} с '
+                  f'({rate:.1f} шт/с). Оценка на остаток: '
+                  f'{with_approx(format_duration(estimate))}')
+            log.info(f'Замер скорости миниатюр: {rate:.1f} шт/с, '
+                     f'оценка остатка {format_duration(estimate)}')
+        if stages:
+            stages.note(f'пробный замер: {made} шт за {spent:.1f} с')
+        pending = pending[len(sample):]
+
+    # 4. Копирование из внешней ico и создание остальных.
+    for rel, path in missing:
+        key = os.path.normcase(rel)
+        if key in sample_keys:
+            continue
+        dest = os.path.join(thumbs_root, *rel.split('/'))
+        if key in existing and not force:
+            register(rel, path, 'skipped')
+        elif key in reusable:
+            try:
+                # Готовая миниатюра из старой папки: снимок не открываем,
+                # копирование в разы дешевле декодирования.
+                parent = os.path.dirname(dest)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                shutil.copy2(reusable[key], dest)
+                existing[key] = rel
+                register(rel, path, 'reused')
+            except OSError as exc:
+                log.warning(f'Не удалось скопировать миниатюру '
+                            f'{reusable[key]}: {exc}')
+                register(rel, path, create(rel, path))
+        else:
+            register(rel, path, create(rel, path))
+
     return result, stats
 
 
@@ -852,7 +1102,8 @@ def resolve_root(root_dir):
 
 
 def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=True,
-         log_path=None, force_thumbs=False, test_limit=None, no_cache=False):
+         log_path=None, force_thumbs=False, test_limit=None, no_cache=False,
+         thumb_sources=None, rescan_thumbs=False):
     started = datetime.now()
     used_default = not root_dir
     root_dir = resolve_root(root_dir)
@@ -867,6 +1118,7 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
         return 1
     if used_default:
         print(f'📂 Папка по умолчанию: {root_dir}')
+
     # В пробном прогоне результаты и лог уходят в отдельную папку:
     # боевые points_*.json и миниатюры не перезаписываются.
     out_dir = os.path.join(root_dir, TEST_DIR_NAME) if test_limit else root_dir
@@ -889,10 +1141,22 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
         os.path.join(root_dir, TEST_DIR_NAME),
     )}
 
-    print('🔍 Подсчет файлов...')
-    files = collect_images(root_dir, excluded_dirs)
+    stages = StageReporter(6 if make_thumbs else 4, log=log)
+
+    # ---- Этап 1: папка с изображениями ----
+    stages.start('Сканирование папки с изображениями', f'обход {root_dir}')
+    shown = []
+
+    def show_files(count, spent):
+        shown.append(count)
+        print(f'   ⏳ обход: {count} изображений, {spent:.0f} с',
+              end='\r', flush=True)
+
+    files = collect_images(root_dir, excluded_dirs, progress=show_files)
+    if shown:
+        print(' ' * 60, end='\r')
     found = len(files)
-    print(f'📸 Найдено изображений: {found}')
+    stages.finish(f'найдено изображений: {found}')
     if not found:
         print('Изображения не найдены; JSON-файлы не созданы.')
         log.info('Изображения не найдены.')
@@ -903,8 +1167,8 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
         files = files[:test_limit]
         print(f'🧪 Пробный прогон: обрабатываю {len(files)} из {found} файлов')
         log.info(f'Пробный прогон: обрабатываю {len(files)} из {found} файлов')
-
     total = len(files)
+
     if not register_heic_support() and any(
             path.lower().endswith(('.heic', '.heif')) for path in files):
         hint = ('HEIC/HEIF не декодируется установленной Pillow: для таких файлов '
@@ -914,26 +1178,108 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
         log.warning(hint)
 
     thumbs = {}
+    thumb_index = None
     if make_thumbs:
-        thumbs, stats = build_thumbnails(files, root_dir, thumbs_root, thumb_size,
-                                         url_base=out_dir, log=log, force=force_thumbs)
-        summary = f'создано {stats["created"]}, уже были {stats["skipped"]}'
-        if stats['reused']:
-            summary += f', скопировано из старой ico {stats["reused"]}'
-        summary += f', ошибок {stats["failed"]}'
-        print(f'🖼️  Миниатюры: {summary}')
-        log.info(f'Миниатюры: {summary}')
+        # ---- Этап 2: внешние папки с готовыми миниатюрами ----
+        sources = []
+        for path in (thumb_sources or []) + [DEFAULT_THUMB_SOURCE_DIR]:
+            if not path:
+                continue
+            path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+            if os.path.normcase(path) not in {os.path.normcase(x) for x in sources}:
+                sources.append(path)
+        if test_limit:
+            # В пробном прогоне миниатюры пишутся в test_run/ico, но готовые
+            # ищем и в боевой папке — только на чтение.
+            sources.append(os.path.join(root_dir, THUMB_DIR_NAME))
+        parent_ico = os.path.join(os.path.dirname(root_dir), THUMB_DIR_NAME)
+        if os.path.isdir(parent_ico) and os.path.normcase(parent_ico) not in {
+                os.path.normcase(x) for x in sources}:
+            sources.append(parent_ico)
+        existing_sources = [path for path in sources if os.path.isdir(path)]
+
+        if existing_sources:
+            stages.start('Предварительное сканирование папок ico',
+                         plural(len(existing_sources), 'папка', 'папки', 'папок')
+                         + ': ' + ', '.join(existing_sources))
+        else:
+            stages.start('Предварительное сканирование папок ico',
+                         'внешних папок не найдено — используются только '
+                         'миниатюры рядом с JSON')
+
+        index_db = os.path.join(out_dir, THUMB_INDEX_FILE_NAME)
+        thumb_index = ThumbIndex(index_db)
+        scanned_now = False
+        for source in existing_sources:
+            shown_scan = []
+
+            def show_scan(dirs, files_count, spent):
+                shown_scan.append(dirs)
+                print(f'   ⏳ обход ico: {dirs} папок, {files_count} файлов, '
+                      f'{spent:.0f} с', end='\r', flush=True)
+
+            result = thumb_index.scan(source, force=rescan_thumbs,
+                                      progress=show_scan)
+            if shown_scan:
+                print(' ' * 70, end='\r')
+            if result is None:
+                continue
+            count, dirs, from_cache = result
+            scanned_now = scanned_now or not from_cache
+            stages.note(f'{source}: файлов {count}, папок {dirs}'
+                        + (' — из кэша SQLite' if from_cache else ' — просканировано'))
+        loaded = thumb_index.load()
+        total_rows = sum(len(v) for v in thumb_index.by_name.values())
+        db_size = os.path.getsize(index_db) / 1e6 if os.path.isfile(index_db) else 0
+        stages.finish(f'в индексе {total_rows} файлов, {loaded} различных имён, '
+                      f'база {index_db} ({db_size:.1f} МБ)'
+                      + (' — просканировано сейчас' if scanned_now
+                         else ' — взято из кэша SQLite'))
+
+        # ---- Этап 3: сопоставление, без единой записи на диск ----
+        stages.start('Сопоставление списков',
+                     plural(total, 'снимок', 'снимка', 'снимков') + ' против '
+                     + plural(len(thumb_index.by_name), 'имени', 'имён', 'имён')
+                     + ' из ico')
+        thumb_index.name_only_hits = 0
+        work = plan_thumbnail_work(files, root_dir, thumbs_root,
+                                   thumb_index, force_thumbs)
+        if thumb_index.name_only_hits:
+            stages.note(f'⚠️  у {thumb_index.name_only_hits} снимков миниатюра '
+                        f'нашлась по имени, но не по структуре папок')
+        stages.finish(f'уже на месте: {work["ready"]}, '
+                      f'скопировать из внешней ico: {len(work["reusable"])}, '
+                      f'создать: {work["todo"]}')
+
+        # ---- Этап 4: копирование и создание ----
+        if work['todo'] == 0 and not work['reusable']:
+            stages.start('Создание миниатюр', 'ничего делать не нужно')
+            stages.finish('все миниатюры уже готовы — этап пропущен')
+        else:
+            stages.start('Создание миниатюр',
+                         f'скопировать {len(work["reusable"])}, '
+                         f'создать {work["todo"]}; папка {thumbs_root}')
+            thumbs, stats = build_thumbnails(
+                files, root_dir, thumbs_root, thumb_size, url_base=out_dir,
+                log=log, force=force_thumbs, thumb_index=thumb_index,
+                stages=stages, work=work)
+            stages.finish(f'создано {stats["created"]}, '
+                          f'скопировано {stats["reused"]}, '
+                          f'уже было {stats["skipped"]}, ошибок {stats["failed"]}')
+        thumb_index.close()
     else:
         print('🖼️  Миниатюры отключены (--no-thumbs).')
 
-    print('⚙️ Извлечение метаданных...')
+    # ---- Этап: метаданные ----
+    stages.start('Извлечение метаданных', f'{total} файлов, кэш '
+                     + ('выключен' if no_cache else 'включён'))
     all_items = []
     date_sources = {}
     folder_dates = {}
     cache_path = os.path.join(out_dir, CACHE_FILE_NAME)
     cache = {} if no_cache else load_metadata_cache(cache_path)
     if cache:
-        print(f'💾 Кэш метаданных: {len(cache)} записей ({cache_path})')
+        stages.note(f'в кэше {len(cache)} записей')
     new_cache = {}
     cache_hits = 0
     report = progress_printer('Метаданные', total)
@@ -955,6 +1301,10 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
                     cache_hits += 1
         if meta is None:
             meta = get_metadata(path, log=log, root_dir=root_dir)
+        elif meta.source == 'folder' and not meta.folder:
+            # В кэше имя папки не хранится — восстанавливаем по пути, без
+            # чтения файла: это две строковые операции.
+            meta = meta._replace(folder=date_from_path(path, root_dir)[2])
         if signature:
             new_cache[rel_path] = [
                 signature[0], signature[1], meta.lat, meta.lon,
@@ -969,27 +1319,26 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
 
     if not no_cache:
         if save_metadata_cache(cache_path, new_cache):
-            print(f'💾 Метаданные в кэше: {len(new_cache)} '
-                  f'(без чтения файлов: {cache_hits})')
+            stages.note(f'кэш обновлён: {len(new_cache)} записей, '
+                        f'без чтения файлов: {cache_hits}')
         else:
             print('⚠️  Не удалось сохранить кэш метаданных.')
-    if cache_hits:
-        print(f'   Файлов, прочитанных заново: {len(files) - cache_hits}')
 
     labels = {'exif': 'EXIF/XMP', 'folder': 'по папке', 'mtime': 'mtime', None: 'без даты'}
     summary = ', '.join(f'{labels.get(key, key)}: {value}'
-                        for key, value in sorted(date_sources.items(), key=lambda kv: str(kv[0])))
-    print(f'🗓️  Источники дат — {summary}')
-    log.info(f'Источники дат: {summary}')
+                        for key, value in sorted(date_sources.items(),
+                                                 key=lambda kv: str(kv[0])))
     if folder_dates:
-        print('   Дата по папке: ' + ', '.join(
-            f'{name} → {value:%Y-%m-%d}' for name, value in list(folder_dates.items())[:3])
-              + (f' и ещё {len(folder_dates) - 3}' if len(folder_dates) > 3 else ''))
-        for name, value in folder_dates.items():
-            log.info(f'Дата из папки: {name} -> {value:%Y-%m-%d}')
-    if date_sources.get('mtime'):
-        print('   Для файлов без EXIF и без даты в папке взято время изменения файла.')
+        summary += '; папки: ' + ', '.join(
+            f'{name} → {value:%Y-%m-%d}'
+            for name, value in list(folder_dates.items())[:3])
+    stages.finish(f'источники дат — {summary}')
+    for name, value in folder_dates.items():
+        log.info(f'Дата из папки: {name} -> {value:%Y-%m-%d}')
 
+    # ---- Этап: группировка и запись JSON ----
+    stages.start('Группировка по годам и запись JSON',
+                 plural(total, 'точка', 'точки', 'точек'))
     by_year = defaultdict(list)
     for item in all_items:
         year = item['timestamp'].year if item['timestamp'] else 'unknown'
@@ -998,6 +1347,7 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
     print(f"📅 Обнаружено годов: {len(by_year)} "
           f"({', '.join(str(y) for y in sorted(by_year, key=str))})")
 
+    written = []
     for year in sorted(by_year, key=str):
         items = by_year[year]
         items.sort(key=lambda item: item['timestamp'] or datetime.min)
@@ -1032,10 +1382,13 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
                     'timestamp': item['timestamp'].isoformat() if item['timestamp'] else None,
                     'fake': False,
                 }
-                # Поле добавляется только при наличии миниатюры: старые клиенты его не знают.
+                # Поле добавляется только при наличии миниатюры:
+                # старые клиенты о нём не знают.
                 if thumbs.get(item['file']):
                     point['thumb'] = thumbs[item['file']]
                 points_out.append(point)
+        # Сортировка до построения линий гарантирует последовательность
+        # псевдопутей по времени.
         for point in fake_points:
             entry = {
                 'lat': point['lat'], 'lon': point['lon'], 'file': point['file'],
@@ -1045,7 +1398,6 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
                 entry['thumb'] = thumbs[point['file']]
             points_out.append(entry)
 
-        # Сортировка до построения линий гарантирует последовательность по времени.
         points_out.sort(key=lambda point: point['timestamp'] or '')
         paths = build_paths(points_out)
 
@@ -1060,8 +1412,11 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
 
         real_count = sum(not point['fake'] for point in points_out)
         fake_count = len(points_out) - real_count
+        written.append((os.path.basename(output_file), real_count,
+                        fake_count, len(paths)))
         print(f'  📁 {os.path.basename(output_file)}: {real_count} реальных + '
               f'{fake_count} фейковых точек, {len(paths)} путей')
+    stages.finish(f'файлов JSON: {len(written)}')
 
     elapsed = (datetime.now() - started).total_seconds()
     print('\n✅ Готово!')
@@ -1075,10 +1430,13 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
         print('   Откройте map.html через локальный сервер.')
     if make_thumbs:
         print(f'🖼️  Миниатюры: {thumbs_root}')
-    print(f'📝 Лог: {log.path} (ошибок: {log.errors}, предупреждений: {log.warnings})')
+    stages.summary()
+    print(f'📝 Лог: {log.path} (ошибок: {log.errors}, '
+          f'предупреждений: {log.warnings})')
     log.info(f'Итог: файлов {total}, ошибок {log.errors}, '
              f'предупреждений {log.warnings}, время {elapsed:.1f} с')
     log.close()
+    return 0
 
 
 def parse_args(argv):
@@ -1096,6 +1454,14 @@ def parse_args(argv):
                         help='пересоздать миниатюры, даже если файлы уже есть')
     parser.add_argument('--no-cache', action='store_true',
                         help='не использовать кэш метаданных (перечитать EXIF у всех файлов)')
+    parser.add_argument('--thumbs-source', action='append', default=None,
+                        metavar='ПАПКА',
+                        help='дополнительная папка с готовыми миниатюрами '
+                             '(можно несколько раз); по умолчанию '
+                             f'{DEFAULT_THUMB_SOURCE_DIR}')
+    parser.add_argument('--rescan-thumbs', action='store_true',
+                        help='заново просканировать внешние папки ico, '
+                             'не доверяя индексу SQLite')
     parser.add_argument('--log', default=None, metavar='ФАЙЛ',
                         help=f'файл журнала (по умолчанию <root>/{LOG_FILE_NAME})')
     parser.add_argument('--test', nargs='?', type=int, const=TEST_FILE_LIMIT,
@@ -1112,4 +1478,5 @@ if __name__ == '__main__':
     sys.exit(main(args.root, thumbs_dir=args.thumbs_dir, thumb_size=args.thumb_size,
                   make_thumbs=not args.no_thumbs, log_path=args.log,
                   force_thumbs=args.force_thumbs, test_limit=args.test,
-                  no_cache=args.no_cache) or 0)
+                  no_cache=args.no_cache, thumb_sources=args.thumbs_source,
+                  rescan_thumbs=args.rescan_thumbs) or 0)
