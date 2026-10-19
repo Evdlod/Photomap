@@ -5,7 +5,7 @@ import random
 import re
 import shutil
 import sys
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 
 from PIL import Image, ImageOps
@@ -30,6 +30,9 @@ TEST_FILE_LIMIT = 1000
 PROGRESS_STEP = 5          # шаг вывода прогресса, процентов
 LOG_CONSOLE_LIMIT = 5      # сколько первых ошибок дублировать в консоль
 SKIP_NOTICE_STEP = 500     # через сколько пропущенных миниатюр сообщать о них
+
+# Результат чтения метаданных: источник даты и папка, из которой она взята.
+Metadata = namedtuple('Metadata', 'lat lon timestamp source folder')
 
 # Папка, которая сканируется, если путь не передан аргументом.
 DEFAULT_PHOTO_DIR = r'D:\YandexDisk\Альбомы по годам'
@@ -237,14 +240,72 @@ def read_exif_timestamp(exif, img=None):
     return None
 
 
-def get_metadata(path, log=None):
-    """Возвращает (широта, долгота, дата); отсутствующие значения равны None."""
+# Папки с датой в имени: 2024_01_31, 2024-01-31, 2024.01.31, 2025_07, _2025.
+# Порядок важен: сначала самое точное совпадение.
+FOLDER_DATE_PATTERNS = (
+    ('day', re.compile(
+        r'^(?P<y>(?:19|20)\d{2})[_\-\.](?P<m>0?[1-9]|1[0-2])'
+        r'[_\-\.](?P<d>0?[1-9]|[12]\d|3[01])(?:$|[_\-\s(.])')),
+    ('month', re.compile(
+        r'^(?P<y>(?:19|20)\d{2})[_\-\.](?P<m>0?[1-9]|1[0-2])(?:$|[_\-\s(.])')),
+    ('year', re.compile(
+        r'^[_\-\.\s]*(?P<y>(?:19|20)\d{2})[_\-\.\s]*(?:$|[_\-\s(.])')),
+)
+
+
+def match_folder_date(name):
+    """Возвращает (дата, точность) по имени папки или (None, None)."""
+    for precision, pattern in FOLDER_DATE_PATTERNS:
+        match = pattern.match(name)
+        if not match:
+            continue
+        year = int(match.group('y'))
+        month = int(match.groupdict().get('m') or 1)
+        day = int(match.groupdict().get('d') or 1)
+        try:
+            return datetime(year, month, day), precision
+        except ValueError:
+            continue      # например 2024_02_31 — некорректная дата, пробуем грубее
+    return None, None
+
+
+def date_from_path(path, root_dir=None):
+    """Дата по папке, в которой лежит файл: 2024_01_31, 2025_07, _2025.
+
+    Идём от папки файла вверх до root_dir и берём первое совпадение —
+    самая близкая папка считается самой точной. Если даты в пути нет,
+    возвращает (None, None).
+    """
+    folder = os.path.dirname(os.path.abspath(path))
+    root = os.path.abspath(root_dir) if root_dir else None
+    while True:
+        name = os.path.basename(folder)
+        found, precision = match_folder_date(name)
+        if found:
+            return found, precision, name
+        if root and os.path.normcase(folder) == os.path.normcase(root):
+            return None, None, None
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return None, None, None
+        folder = parent
+
+
+def get_metadata(path, log=None, root_dir=None):
+    """Возвращает (широта, долгота, дата, источник даты).
+
+    Источник: 'exif' (EXIF/XMP), 'folder' (имя папки), 'mtime' (файловая
+    система) или None, если дата не определена.
+    """
     log = log or DEFAULT_LOG
     lat = lon = timestamp = None
+    source = None
     try:
         with Image.open(path) as img:
             exif = img.getexif()
             timestamp = read_exif_timestamp(exif, img)
+            if timestamp:
+                source = 'exif'
 
             gps_ifd = exif.get_ifd(0x8825)
             if gps_ifd:
@@ -269,12 +330,20 @@ def get_metadata(path, log=None):
     except Exception as exc:
         log.error(f'Не удалось прочитать метаданные {path}: {exc}')
 
+    # Нет даты в метаданных — пробуем имя папки (2024_01_31, 2025_07, _2025),
+    # и только в последнюю очередь время изменения файла.
+    folder_name = None
+    if timestamp is None:
+        timestamp, _precision, folder_name = date_from_path(path, root_dir)
+        if timestamp:
+            source = 'folder'
     if timestamp is None:
         try:
             timestamp = datetime.fromtimestamp(os.path.getmtime(path))
+            source = 'mtime'
         except OSError:
             pass
-    return lat, lon, timestamp
+    return Metadata(lat, lon, timestamp, source, folder_name)
 
 
 def plan_thumbnails(files, root_dir):
@@ -534,12 +603,32 @@ def main(root_dir=None, thumbs_dir=None, thumb_size=THUMB_MAX_SIZE, make_thumbs=
 
     print('⚙️ Извлечение метаданных...')
     all_items = []
+    date_sources = {}
+    folder_dates = {}
     report = progress_printer('Метаданные', total)
     for index, path in enumerate(files, 1):
-        lat, lon, timestamp = get_metadata(path, log=log)
+        meta = get_metadata(path, log=log, root_dir=root_dir)
+        date_sources[meta.source] = date_sources.get(meta.source, 0) + 1
+        if meta.source == 'folder':
+            folder_dates.setdefault(meta.folder, meta.timestamp)
         rel_path = os.path.relpath(path, out_dir).replace('\\', '/')
-        all_items.append({'lat': lat, 'lon': lon, 'timestamp': timestamp, 'file': rel_path})
+        all_items.append({'lat': meta.lat, 'lon': meta.lon,
+                          'timestamp': meta.timestamp, 'file': rel_path})
         report(index)
+
+    labels = {'exif': 'EXIF/XMP', 'folder': 'по папке', 'mtime': 'mtime', None: 'без даты'}
+    summary = ', '.join(f'{labels.get(key, key)}: {value}'
+                        for key, value in sorted(date_sources.items(), key=lambda kv: str(kv[0])))
+    print(f'🗓️  Источники дат — {summary}')
+    log.info(f'Источники дат: {summary}')
+    if folder_dates:
+        print('   Дата по папке: ' + ', '.join(
+            f'{name} → {value:%Y-%m-%d}' for name, value in list(folder_dates.items())[:3])
+              + (f' и ещё {len(folder_dates) - 3}' if len(folder_dates) > 3 else ''))
+        for name, value in folder_dates.items():
+            log.info(f'Дата из папки: {name} -> {value:%Y-%m-%d}')
+    if date_sources.get('mtime'):
+        print('   Для файлов без EXIF и без даты в папке взято время изменения файла.')
 
     by_year = defaultdict(list)
     for item in all_items:
