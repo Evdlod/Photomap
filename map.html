@@ -5,10 +5,11 @@
 <title>Фото-карта</title>
 <style>
 *{box-sizing:border-box}html,body,#map{width:100%;height:100%;margin:0;font:14px system-ui,Arial,sans-serif}#map{position:absolute;inset:0}.toolbar{position:absolute;z-index:500;top:14px;left:14px;display:flex;gap:8px;align-items:center;padding:10px 12px;background:#fff;border-radius:12px;box-shadow:0 3px 18px #0003}.toolbar input{width:90px;padding:8px;border:1px solid #ccd2dc;border-radius:7px}.toolbar button{padding:8px 12px;border:0;border-radius:7px;background:#5144bd;color:#fff;cursor:pointer}.toolbar label{display:flex;align-items:center;gap:6px}.status{position:absolute;z-index:600;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(540px,90vw);padding:18px 22px;background:#202431;color:white;border-radius:12px;box-shadow:0 5px 25px #0004;text-align:center}.status.error{background:#7c2525}.balloon{max-width:300px;overflow-wrap:anywhere;line-height:1.55}.balloon a{color:#185abc}.legend{font-size:12px;color:#555}.fake{color:#a65c00}.thumb-preview{position:absolute;z-index:700;pointer-events:none;background:#fff;border-radius:10px;box-shadow:0 8px 28px #0005;padding:6px;max-width:220px}.thumb-preview img{display:block;max-width:208px;max-height:208px;border-radius:6px;object-fit:contain;background:#f1f3f7}.thumb-preview .caption{margin-top:4px;font-size:12px;color:#3b4252;max-width:208px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.spread-chip{width:52px;height:52px;margin:-26px 0 0 -26px;border-radius:9px;overflow:hidden;border:2px solid #fff;box-shadow:0 3px 10px #0005;background:#e9edf5;cursor:pointer;transition:transform .12s,box-shadow .12s,border-color .12s}
+.spread-layer{position:absolute;inset:0;z-index:450;pointer-events:none}
+.spread-chip{position:absolute;pointer-events:auto;width:52px;height:52px;border-radius:9px;overflow:hidden;border:2px solid #fff;box-shadow:0 3px 10px #0005;background:#e9edf5;cursor:pointer;transition:transform .12s,box-shadow .12s,border-color .12s}
 .spread-chip img{width:100%;height:100%;object-fit:cover;display:block}
 .spread-chip:hover{transform:scale(1.18);box-shadow:0 6px 16px #0006;border-color:#5144bd}
-.spread-dot{width:25px;height:25px;margin:-12.5px 0 0 -12.5px;border-radius:50%;background:#5144bd;border:2px solid #fff;box-shadow:0 2px 8px #0005;cursor:pointer;transition:transform .12s}
+.spread-dot{position:absolute;pointer-events:auto;width:25px;height:25px;border-radius:50%;background:#5144bd;border:2px solid #fff;box-shadow:0 2px 8px #0005;cursor:pointer;transition:transform .12s}
 .spread-dot:hover{transform:scale(1.3);background:#3f34a0}
 .map-toast{position:absolute;z-index:800;left:50%;bottom:24px;transform:translateX(-50%);background:#202431e8;color:#fff;padding:9px 15px;border-radius:9px;font-size:13px;box-shadow:0 4px 18px #0004;pointer-events:none}
 </style>
@@ -21,7 +22,7 @@ const status=document.getElementById('status'); let map, clusterer, lineLayer, l
 let currentPoints=[], currentPaths=[], currentYear='', activeIndex=-1, cursorX=0, cursorY=0, previewEl=null;
 // Псевдоразнесение кластера: до 30 миниатюр по трём кольцам вокруг центра группы.
 const SPREAD_LIMIT=30, SPREAD_RINGS=[[52,8],[96,12],[140,10]];
-let spreadLayer=null, spreadTimer=null, spreadCluster=null, toastEl=null, toastTimer=null;
+let spreadEl=null, spreadPins=[], spreadTimer=null, spreadCluster=null, toastEl=null, toastTimer=null;
 function message(text,error=false){status.textContent=text;status.classList.toggle('error',error);status.hidden=false}
 function clearStatus(){status.hidden=true}
 function safeUrl(path){return path.split('/').map(encodeURIComponent).join('/')}
@@ -29,8 +30,6 @@ function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':
 function validPoint(p){return p&&Number.isFinite(Number(p.lat))&&Number.isFinite(Number(p.lon))&&Math.abs(Number(p.lat))<=90&&Math.abs(Number(p.lon))<=180}
 function init(){
  map=new ymaps.Map('map',{center:[55.75,37.61],zoom:5,controls:['zoomControl','fullscreenControl']},{suppressMapOpenBlock:true});
- THUMB_CHIP_LAYOUT=ymaps.templateLayoutFactory.createClass('<div class="spread-chip"><img src="{{ properties.thumb }}" alt=""></div>');
- DOT_CHIP_LAYOUT=ymaps.templateLayoutFactory.createClass('<div class="spread-dot"></div>');
  // clusterHasHint:false — подсказка кластера перекрывала бы развёрнутые миниатюры.
  clusterer=new ymaps.Clusterer({preset:'islands#invertedVioletClusterIcons',groupByCoordinates:false,gridSize:64,clusterHasHint:false});
  // У Clusterer нет события mouseenter (есть только hintopen/hintclose и balloonopen/balloonclose),
@@ -38,14 +37,19 @@ function init(){
  const baseCreateCluster=ymaps.Clusterer.prototype.createCluster;
  clusterer.createCluster=function(center,geoObjects){
   const cluster=baseCreateCluster.call(this,center,geoObjects);
-  try{cluster.properties.set('pointObjects',geoObjects)}catch(e){}
   cluster.events.add('mouseenter',()=>showSpread(cluster));
   cluster.events.add('mouseleave',scheduleCollapse);
   return cluster;
  };
  // clusterer.events наведения не эмитит, поэтому подписки здесь нет.
- // При смене масштаба или сдвиге карты разнесённые метки устаревают.
+ // Закрытие балуна кластера (его открывает клик по развёрнутой миниатюре)
+ // снимает активную точку так же, как у одиночной метки.
+ clusterer.events.add('balloonclose',()=>{activeIndex=-1;hideThumbPreview();scheduleCollapse()});
+ // При смене масштаба или сдвиге карты разнесённые миниатюры устаревают:
+ // их позиции посчитаны в пикселях для текущего вида. Клик по пустому
+ // месту карты тоже сворачивает группу.
  map.events.add('boundschange',clearSpread);
+ map.events.add('click',clearSpread);
  lineLayer=new ymaps.GeoObjectCollection();map.geoObjects.add(lineLayer);
  document.getElementById('load').addEventListener('click',loadYear);
  document.getElementById('year').addEventListener('keydown',e=>{if(e.key==='Enter')loadYear()});
@@ -60,7 +64,7 @@ async function loadYear(){
   const data=await response.json();if(requestId!==loadRequest)return;if(!data||!Array.isArray(data.points))throw new Error('Некорректный JSON: ожидался объект с массивом points.');
   const points=data.points;const validEntries=points.map((p,index)=>({p,index})).filter(x=>validPoint(x.p));if(!validEntries.length){message('В этом файле нет точек с корректными координатами.');return}
   currentPoints=points;currentPaths=Array.isArray(data.paths)?data.paths:[];currentYear=year;activeIndex=-1;hideThumbPreview();
-  const objects=validEntries.map(({index})=>makePlacemark(index,'cluster'));
+  const objects=validEntries.map(({index})=>makePlacemark(index));
   clusterer.add(objects);map.geoObjects.add(clusterer);
   // paths содержит индексы точек в массиве points из генератора.
   if(Array.isArray(data.paths))for(const path of data.paths){if(!Array.isArray(path)||path.length<2)continue;const coords=path.map(i=>Number.isInteger(i)?points[i]:null).filter(validPoint).map(p=>[Number(p.lat),Number(p.lon)]);if(coords.length>=2)lineLayer.add(new ymaps.Polyline(coords,{}, {strokeColor:'#5144bd99',strokeWidth:3,strokeOpacity:.55}))}
@@ -102,17 +106,25 @@ function showThumbPreview(index,clientX,clientY){
  caption.className='caption';caption.textContent=baseName(currentPoints[index]&&currentPoints[index].file);
  el.replaceChildren(img,caption);el.hidden=false;placePreview(clientX,clientY);
 }
+function photoWord(count){
+ const n=Math.abs(count)%100, k=n%10;
+ if(n>10&&n<20)return 'фотографий';
+ if(k===1)return 'фотография';
+ if(k>=2&&k<=4)return 'фотографии';
+ return 'фотографий';
+}
 function toast(text){
  const mapEl=document.getElementById('map');
  if(!toastEl){toastEl=document.createElement('div');toastEl.className='map-toast';mapEl.appendChild(toastEl)}
  toastEl.textContent=text;toastEl.hidden=false;
  clearTimeout(toastTimer);toastTimer=setTimeout(()=>{toastEl.hidden=true},2600);
 }
-// Состав кластера: сначала сохранённый при создании список, затем API-метод.
+// Состав кластера: документированный метод ClusterPlacemark.getGeoObjects().
+// Свою копию в properties не держим — она раздувает данные кластера и
+// переживает пересчёт, из-за чего можно получить ссылки на уже удалённые метки.
 function clusterObjects(target){
  if(!target||target===clusterer)return null;   // сам кластеризатор — не кластер
- try{const stored=target.properties&&target.properties.get('pointObjects');if(Array.isArray(stored)&&stored.length)return stored}catch(e){}
- try{if(typeof target.getGeoObjects==='function')return target.getGeoObjects()}catch(e){}
+ try{if(typeof target.getGeoObjects==='function'){const list=target.getGeoObjects();if(Array.isArray(list))return list}}catch(e){}
  try{const list=target.properties&&target.properties.get('geoObjects');if(Array.isArray(list))return list}catch(e){}
  return null;
 }
@@ -156,67 +168,94 @@ function balloonProps(index){
   thumb:p.thumb?String(p.thumb).replace(/["'<>]/g,''):'',
  };
 }
-// Макеты создаются в init(): до загрузки API объект ymaps ещё не существует.
-let THUMB_CHIP_LAYOUT=null, DOT_CHIP_LAYOUT=null;
-function makePlacemark(index,mode,coords){
- const p=currentPoints[index]||{};const fake=Boolean(p.fake);const thumb=!!p.thumb;
+function makePlacemark(index){
+ const p=currentPoints[index]||{};const fake=Boolean(p.fake);
  const props=balloonProps(index);
- const pos=coords||[Number(p.lat),Number(p.lon)];
- let placemark;
- if(mode==='spread'){
-  placemark=new ymaps.Placemark(pos,props,{
-   iconLayout:thumb?THUMB_CHIP_LAYOUT:DOT_CHIP_LAYOUT,
-   iconShape:'circle',
-  });
-  placemark.events.add('mouseenter',()=>{holdSpread();showThumbPreview(index)});
-  placemark.events.add('mouseleave',()=>{hideThumbPreview();scheduleCollapse()});
- }else{
-  placemark=new ymaps.Placemark(pos,props,{preset:fake?'islands#orangeCircleDotIcon':'islands#violetDotIcon'});
-  placemark.events.add('mouseenter',()=>showThumbPreview(index));
-  placemark.events.add('mouseleave',hideThumbPreview);
- }
+ const pos=[Number(p.lat),Number(p.lon)];
+ const placemark=new ymaps.Placemark(pos,props,{preset:fake?'islands#orangeCircleDotIcon':'islands#violetDotIcon'});
+ placemark.events.add('mouseenter',()=>showThumbPreview(index));
+ placemark.events.add('mouseleave',hideThumbPreview);
  placemark.events.add('balloonopen',()=>{activeIndex=index;holdSpread()});
  placemark.events.add('balloonclose',()=>{activeIndex=-1;hideThumbPreview();scheduleCollapse()});
  return placemark;
 }
 function clearSpread(){
  if(spreadTimer){clearTimeout(spreadTimer);spreadTimer=null}
- if(spreadLayer){try{map.geoObjects.remove(spreadLayer)}catch(e){}spreadLayer=null}
- spreadCluster=null;
+ if(spreadEl){spreadEl.remove();spreadEl=null}
+ spreadCluster=null;spreadPins=[];
 }
 function holdSpread(){if(spreadTimer){clearTimeout(spreadTimer);spreadTimer=null}}
 // Пауза перед сворачиванием: курсор должен успеть дойти от значка группы до миниатюры.
 function scheduleCollapse(){
- if(!spreadLayer)return;
+ if(!spreadEl)return;
  holdSpread();
  spreadTimer=setTimeout(()=>{spreadTimer=null;if(activeIndex<0)clearSpread()},500);
 }
+// Разворот группы рисуется обычными элементами поверх карты, а не метками API:
+// у кастомного макета метки API не строит область попадания (iconShape падает
+// в createShape), поэтому клики и наведение до неё не доходят. DOM-слой
+// заодно не участвует в кластеризации и не может «уронить» метки на карте.
 function showSpread(cluster){
+ try{spreadOnce(cluster)}catch(e){console.error('Не удалось развернуть группу',e);clearSpread()}
+}
+function spreadOnce(cluster){
  const objects=clusterObjects(cluster);
  if(!objects||objects.length<2)return;              // одиночная метка — у неё свои обработчики
  if(spreadCluster===cluster){holdSpread();return}
  clearSpread();
  if(objects.length>SPREAD_LIMIT){
-  toast(`В группе ${objects.length} фотографий — разворачиваем не больше ${SPREAD_LIMIT}. Увеличьте масштаб.`);
+  toast(`В группе ${objects.length} ${photoWord(objects.length)} — разворачиваем не больше ${SPREAD_LIMIT}. Увеличьте масштаб.`);
   return;
  }
  let center;
  try{center=cluster.geometry.getCoordinates()}catch(e){return}
+ let page;
+ try{
+  const gp=map.options.get('projection').toGlobalPixels(center,map.getZoom());
+  page=map.converter.globalToPage(gp);
+ }catch(e){return}
+ const mapEl=document.getElementById('map'),rect=mapEl.getBoundingClientRect();
+ const cx=page[0]-rect.left,cy=page[1]-rect.top;
  const offsets=spreadOffsets(objects.length);
- const layer=new ymaps.GeoObjectCollection();
- let placed=0;
+ const layer=document.createElement('div');
+ layer.className='spread-layer';
+ const pins=[];
  objects.forEach((object,i)=>{
   let index=NaN;
   try{index=Number(object.properties.get('pointIndex'))}catch(e){}
   if(!Number.isInteger(index)||!validPoint(currentPoints[index]))return;
   const {radius,angle}=offsets[i];
-  const coords=offsetGeoPoint(center,Math.cos(angle)*radius,Math.sin(angle)*radius);
-  layer.add(makePlacemark(index,'spread',coords));
-  placed++;
+  const x=cx+Math.cos(angle)*radius, y=cy+Math.sin(angle)*radius;
+  const el=document.createElement('div');
+  const thumb=currentPoints[index].thumb;
+  el.className=thumb?'spread-chip':'spread-dot';
+  el.title=baseName(currentPoints[index].file);
+  if(thumb){
+   const img=document.createElement('img');
+   img.src=safeUrl(String(thumb));img.alt='';img.loading='lazy';
+   el.appendChild(img);
+  }
+  el.style.left=Math.round(x-(thumb?26:12.5))+'px';
+  el.style.top=Math.round(y-(thumb?26:12.5))+'px';
+  el.addEventListener('mouseenter',()=>{holdSpread();showThumbPreview(index)});
+  el.addEventListener('mouseleave',()=>{hideThumbPreview();scheduleCollapse()});
+  el.addEventListener('click',event=>{event.stopPropagation();openClusterItem(cluster,object,index)});
+  layer.appendChild(el);
+  pins.push(el);
  });
- if(!placed)return;
- map.geoObjects.add(layer);
- spreadLayer=layer;spreadCluster=cluster;
+ if(!pins.length)return;
+ mapEl.appendChild(layer);
+ spreadEl=layer;spreadCluster=cluster;spreadPins=pins;
+}
+// Открываем балун выбранного снимка штатным способом кластеризатора.
+function openClusterItem(cluster,object,index){
+ activeIndex=index;
+ holdSpread();
+ // activeObject — документированный способ открыть балун кластера
+ // сразу на нужном снимке; если state недоступен, открываем балун как есть.
+ try{if(cluster.state&&cluster.state.set)cluster.state.set('activeObject',object)}catch(e){}
+ try{clusterer.balloon.open(cluster);return}catch(e){}
+ try{object.balloon.open()}catch(e){}
 }
 document.addEventListener('mousemove',e=>{cursorX=e.clientX;cursorY=e.clientY});
 // Наведение на открытый балун: превью всплывает рядом с курсором.
