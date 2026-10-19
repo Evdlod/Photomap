@@ -471,6 +471,133 @@ def build_paths(points):
     return paths
 
 
+def index_thumbnails(thumbs_root):
+    """Собирает готовые миниатюры одним проходом по папке ico.
+
+    Возвращает словарь {нормализованный путь: путь как на диске}. Индекс
+    заменяет отдельный stat на каждую фотографию: на коллекции в сотни
+    тысяч файлов это сильно быстрее, особенно на облачном/сетевом диске.
+    """
+    existing = {}
+    if not os.path.isdir(thumbs_root):
+        return existing
+    # os.scandir обходит дерево быстрее os.walk: размер берётся из записи каталога.
+    stack = [thumbs_root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.name.lower().endswith('.jpg'):
+                            continue
+                        if entry.stat().st_size <= 0:
+                            continue      # пустой/обрезанный файл — пересоздадим
+                    except OSError:
+                        continue
+                    rel = os.path.relpath(entry.path, thumbs_root).replace('\\', '/')
+                    existing[os.path.normcase(rel)] = rel
+        except OSError:
+            continue
+    return existing
+
+
+def explain_root_mismatch(existing, plan):
+    """Ищет объяснение: миниатюры есть, но пути не совпадают с текущим корнем.
+
+    Сравниваем по имени файла: если миниатюра с таким же именем лежит под
+    другим префиксом, значит ico создавалась для другой корневой папки —
+    самый частый случай после изменения папки по умолчанию.
+    Возвращает текст подсказки или None.
+    """
+    if not existing:
+        return None
+    by_name = {}
+    for rel in existing.values():
+        by_name.setdefault(rel.rsplit('/', 1)[-1], []).append(rel)
+    samples = []
+    for rel_thumb in plan.values():
+        name = rel_thumb.rsplit('/', 1)[-1]
+        for found in by_name.get(name, ()):
+            if found != rel_thumb and found.endswith('/' + rel_thumb):
+                prefix = found[:-len(rel_thumb)].rstrip('/')
+                samples.append((prefix, found, rel_thumb))
+                break
+        if len(samples) >= 20:
+            break
+    if not samples:
+        return None
+    prefixes = {prefix for prefix, _, _ in samples}
+    if len(prefixes) == 1:
+        prefix = samples[0][0]
+        return (f'Готовые миниатюры лежат в подпапке «{prefix}». '
+                f'Похоже, ico создавалась для родительской папки. Перенесите '
+                f'{os.path.join(THUMB_DIR_NAME, *prefix.split("/"))} в '
+                f'{os.path.join(os.path.basename(prefix), THUMB_DIR_NAME)} — '
+                f'тогда пути совпадут и миниатюры не придётся создавать заново.')
+    prefix, found, expected = samples[0]
+    return (f'Есть похожая миниатюра {found}, а ожидается {expected}. '
+            f'Похоже, ico создавалась для другой корневой папки.')
+
+
+def find_thumb_migration_hint(root_dir, thumbs_root, plan):
+    """Подсказка, если готовые миниатюры лежат в ico родительской папки.
+
+    Типичный случай: раньше сканировали `...\\new1`, миниатюры легли в
+    `...\\new1\\ico\\Альбомы по годам\\...`, а теперь корень —
+    `...\\new1\\Альбомы по годам`, и ожидается
+    `...\\new1\\Альбомы по годам\\ico\\...`. Пути не совпадают, хотя
+    сами миниатюры уже есть. Возвращает текст с готовым решением.
+    """
+    root_abs = os.path.abspath(root_dir)
+    parent_ico = os.path.join(os.path.dirname(root_abs), THUMB_DIR_NAME)
+    if not os.path.isdir(parent_ico):
+        return None
+    if os.path.normcase(parent_ico) == os.path.normcase(os.path.abspath(thumbs_root)):
+        return None
+
+    expected_by_name = {}
+    for rel in plan.values():
+        expected_by_name.setdefault(os.path.normcase(rel.rsplit('/', 1)[-1]), []).append(rel)
+
+    prefixes = set()
+    example = None
+    found = 0
+    for dirpath, _, filenames in os.walk(parent_ico):
+        for name in filenames:
+            if not name.lower().endswith('.jpg'):
+                continue
+            for expected in expected_by_name.get(os.path.normcase(name), ()):
+                rel = os.path.relpath(os.path.join(dirpath, name), parent_ico)
+                rel = rel.replace('\\', '/')
+                normed = os.path.normcase(rel)
+                if not normed.endswith('/' + os.path.normcase(expected)):
+                    continue
+                prefix = rel[:len(rel) - len(expected)].rstrip('/')
+                prefixes.add(prefix)
+                example = example or (rel, expected)
+                found += 1
+        if found >= 20:
+            break
+    if not found:
+        return None
+
+    if len(prefixes) == 1:
+        prefix = prefixes.pop()
+        source = os.path.join(parent_ico, *prefix.split('/'))
+        target = os.path.join(root_abs, THUMB_DIR_NAME)
+        return (f'Похоже, миниатюры уже созданы для папки верхнего уровня: '
+                f'{source}. Перенесите эту папку в {target} (или запустите '
+                f'скрипт с корнем {os.path.dirname(root_abs)}) — тогда готовые '
+                f'миниатюры будут переиспользованы, а не созданы заново.')
+    existing_rel, expected_rel = example
+    return (f'Есть похожая миниатюра {existing_rel}, а ожидается {expected_rel}. '
+            f'Похоже, ico создавалась для другой корневой папки.')
+
+
 def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
                      url_base=None, log=None, force=False):
     """Создаёт недостающие миниатюры.
@@ -493,12 +620,34 @@ def build_thumbnails(files, root_dir, thumbs_root, thumb_size,
 
     plan = plan_thumbnails(files, root_dir)
     print(f'🖼️  Миниатюры (не более {thumb_size} px) в {thumbs_root}')
+    print('🗂️  Индексирую готовые миниатюры…')
+    existing = index_thumbnails(thumbs_root)
+    ready = 0 if force else sum(1 for rel in plan.values()
+                                if os.path.normcase(rel) in existing)
+    todo = len(plan) - ready
+    print(f'   готово: {ready}, создать: {todo}'
+          + (' (--force-thumbs: пересоздаём всё)' if force else ''))
+    log.info(f'Миниатюры: план {len(plan)}, готово {ready}, создать {todo}')
+    if todo and not ready and not force:
+        hint = explain_root_mismatch(existing, plan) or \
+            find_thumb_migration_hint(root_dir, thumbs_root, plan)
+        if hint:
+            print(f'⚠️  {hint}')
+            log.warning(hint)
+
     report = progress_printer('Миниатюры', len(plan))
     result = {}
     stats = {'created': 0, 'skipped': 0, 'failed': 0}
     for index, (path, rel_thumb) in enumerate(plan.items(), 1):
-        dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
-        status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
+        key = os.path.normcase(rel_thumb)
+        if not force and key in existing:
+            # Файл уже есть — источник не открываем вообще.
+            status = 'skipped'
+        else:
+            dest = os.path.join(thumbs_root, *rel_thumb.split('/'))
+            status = make_thumbnail(path, dest, thumb_size, log=log, force=force)
+            if status == 'created':
+                existing[key] = rel_thumb
         stats[status] += 1
         if status == 'skipped' and stats['skipped'] % SKIP_NOTICE_STEP == 0:
             note = (f'Пропущено уже готовых миниатюр: {stats["skipped"]} '
