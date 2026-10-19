@@ -31,10 +31,19 @@ function init(){
  map=new ymaps.Map('map',{center:[55.75,37.61],zoom:5,controls:['zoomControl','fullscreenControl']},{suppressMapOpenBlock:true});
  THUMB_CHIP_LAYOUT=ymaps.templateLayoutFactory.createClass('<div class="spread-chip"><img src="{{ properties.thumb }}" alt=""></div>');
  DOT_CHIP_LAYOUT=ymaps.templateLayoutFactory.createClass('<div class="spread-dot"></div>');
- clusterer=new ymaps.Clusterer({preset:'islands#invertedVioletClusterIcons',groupByCoordinates:false,gridSize:64});
- // Наведение на группу разворачивает её в отдельные миниатюры (до 30 штук).
- clusterer.events.add('mouseenter',e=>{const target=e.get('target');if(clusterObjects(target))showSpread(target)});
- clusterer.events.add('mouseleave',scheduleCollapse);
+ // clusterHasHint:false — подсказка кластера перекрывала бы развёрнутые миниатюры.
+ clusterer=new ymaps.Clusterer({preset:'islands#invertedVioletClusterIcons',groupByCoordinates:false,gridSize:64,clusterHasHint:false});
+ // У Clusterer нет события mouseenter (есть только hintopen/hintclose и balloonopen/balloonclose),
+ // поэтому подписываемся на каждый созданный кластер через документированную точку расширения.
+ const baseCreateCluster=ymaps.Clusterer.prototype.createCluster;
+ clusterer.createCluster=function(center,geoObjects){
+  const cluster=baseCreateCluster.call(this,center,geoObjects);
+  try{cluster.properties.set('pointObjects',geoObjects)}catch(e){}
+  cluster.events.add('mouseenter',()=>showSpread(cluster));
+  cluster.events.add('mouseleave',scheduleCollapse);
+  return cluster;
+ };
+ // clusterer.events наведения не эмитит, поэтому подписки здесь нет.
  // При смене масштаба или сдвиге карты разнесённые метки устаревают.
  map.events.add('boundschange',clearSpread);
  lineLayer=new ymaps.GeoObjectCollection();map.geoObjects.add(lineLayer);
@@ -99,10 +108,12 @@ function toast(text){
  toastEl.textContent=text;toastEl.hidden=false;
  clearTimeout(toastTimer);toastTimer=setTimeout(()=>{toastEl.hidden=true},2600);
 }
-// Состав кластера: ClusterPlacemark.getGeoObjects() — это properties.get('geoObjects').
+// Состав кластера: сначала сохранённый при создании список, затем API-метод.
 function clusterObjects(target){
- try{if(target&&typeof target.getGeoObjects==='function')return target.getGeoObjects()}catch(e){}
- try{const list=target&&target.properties&&target.properties.get('geoObjects');if(Array.isArray(list))return list}catch(e){}
+ if(!target||target===clusterer)return null;   // сам кластеризатор — не кластер
+ try{const stored=target.properties&&target.properties.get('pointObjects');if(Array.isArray(stored)&&stored.length)return stored}catch(e){}
+ try{if(typeof target.getGeoObjects==='function')return target.getGeoObjects()}catch(e){}
+ try{const list=target.properties&&target.properties.get('geoObjects');if(Array.isArray(list))return list}catch(e){}
  return null;
 }
 // Смещение в пикселях экрана -> географические координаты на текущем зуме.

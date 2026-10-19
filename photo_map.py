@@ -173,16 +173,68 @@ def dms_to_dd(dms, ref):
 
 
 def parse_exif_datetime(value):
-    """Парсит стандартную EXIF-дату вида '2023:05:15 14:30:00'."""
+    """Парсит дату EXIF: '2023:05:15 14:30:00' и близкие варианты.
+
+    Встречаются файлы с долями секунды, смещением часового пояса, форматом
+    через дефис или без секунд — такие значения тоже разбираем.
+    """
     if not value:
         return None
     if isinstance(value, bytes):
         value = value.decode('utf-8', errors='ignore')
-    value = str(value).strip().strip('\x00')
+    value = str(value).strip().strip('\x00').strip()
+    # '2023:05:15 14:30:00.123+03:00' -> '2023:05:15 14:30:00'
+    value = re.split(r'[.\s]?(?:Z|[+-]\d{2}:?\d{2})$', value)[0]
+    value = re.sub(r'\.\d+$', '', value).strip()
+    for fmt in ('%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S',
+                '%Y:%m:%d %H:%M', '%Y-%m-%dT%H:%M:%S', '%Y:%m:%d'):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def read_exif_timestamp(exif, img=None):
+    """Дата съёмки из EXIF: Exif-подкаталог, затем IFD0, затем XMP.
+
+    Теги DateTimeOriginal (0x9003) и DateTimeDigitized (0x9004) лежат
+    в Exif-подкаталоге (0x8769), а не в основном IFD. DateTime (0x0132)
+    наоборот — в основном. Читаем оба места: раньше 0x9003 искали только
+    в основном IFD, поэтому дата почти всегда терялась и бралась из mtime.
+    """
+    exif_ifd = {}
     try:
-        return datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
-    except ValueError:
-        return None
+        exif_ifd = exif.get_ifd(0x8769) or {}
+    except Exception:
+        exif_ifd = {}
+
+    for tag_id in (0x9003, 0x9004, 0x0132):
+        # Сначала подкаталог, потом основной IFD — на случай нестандартной записи.
+        for source in (exif_ifd, exif):
+            try:
+                value = source.get(tag_id)
+            except Exception:
+                value = None
+            timestamp = parse_exif_datetime(value)
+            if timestamp:
+                return timestamp
+
+    # Некоторые конвертеры пишут дату только в XMP.
+    if img is not None:
+        xmp = img.info.get('xmp') or exif.get(700) or b''
+        if isinstance(xmp, bytes):
+            xmp = xmp.decode('utf-8', errors='ignore')
+        if xmp:
+            for pattern in (r'exif:DateTimeOriginal[^>]*>([^<]+)<',
+                            r'photoshop:DateCreated[^>]*>([^<]+)<',
+                            r'xmp:CreateDate[^>]*>([^<]+)<'):
+                match = re.search(pattern, xmp)
+                if match:
+                    timestamp = parse_exif_datetime(match.group(1))
+                    if timestamp:
+                        return timestamp
+    return None
 
 
 def get_metadata(path, log=None):
@@ -192,10 +244,7 @@ def get_metadata(path, log=None):
     try:
         with Image.open(path) as img:
             exif = img.getexif()
-            for tag_id in (0x9003, 0x9004, 0x0132):
-                timestamp = parse_exif_datetime(exif.get(tag_id))
-                if timestamp:
-                    break
+            timestamp = read_exif_timestamp(exif, img)
 
             gps_ifd = exif.get_ifd(0x8825)
             if gps_ifd:
